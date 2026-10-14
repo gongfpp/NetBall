@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>实时流量监控工具 · 截图对比</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:32px 24px 80px; background:#0d141c; color:#dbe7f3;
+         font: 15px/1.65 -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; }
+  h1 { font-size: 26px; margin:0 0 6px; }
+  .sub { color:#8ba3ba; margin-bottom:28px; }
+  h2 { font-size: 19px; margin:44px 0 14px; padding-bottom:8px; border-bottom:1px solid #1e2c3b; }
+  table { border-collapse: collapse; width:100%; font-size:14px; }
+  th, td { text-align:left; padding:9px 12px; border-bottom:1px solid #1b2836; vertical-align:top; }
+  th { color:#8ba3ba; font-weight:600; background:#111b25; position:sticky; top:0; }
+  .yes { color:#5fd08a; } .no { color:#e0665f; } .part { color:#e8b552; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(430px, 1fr)); gap:22px; }
+  .card { background:#111b25; border:1px solid #1e2c3b; border-radius:14px; overflow:hidden; }
+  .card img { display:block; width:100%; height:auto; background:#0a1119; }
+  .card .body { padding:14px 16px 18px; }
+  .card h3 { margin:0 0 6px; font-size:16px; }
+  .card p { margin:0; color:#8ba3ba; font-size:13.5px; }
+  .tag { display:inline-block; font-size:12px; padding:2px 8px; border-radius:20px; margin-right:6px;
+         background:#1b2a3a; color:#9ec4e6; }
+  .tag.hot { background:#2a1f12; color:#f0b969; }
+  code { background:#16222e; padding:1px 6px; border-radius:5px; font-size:13px; }
+  .note { color:#8ba3ba; font-size:13px; margin-top:10px; }
+</style>
+</head>
+<body>
+<h1>实时流量监控工具 · 截图对比</h1>
+<div class="sub">目标：常驻置顶 + 实时上下行 + 按进程看谁最耗流量（对标 360 加速球）。截图为各官方渠道原图，仅做等比缩放。</div>
+
+<table>
+  <tr><th>工具</th><th>平台</th><th>进程级流量</th><th>悬浮/置顶</th><th>价格</th></tr>
+  <tr><td><b>NetWorx</b></td><td>Win / macOS / Linux</td><td class="yes">✅ 应用列表</td><td class="yes">✅ 浮动图表</td><td>30 天试用后付费</td></tr>
+  <tr><td><b>iNTM</b></td><td>macOS 15+</td><td class="yes">✅ 每 App 实时</td><td class="part">△ 菜单栏</td><td>订阅 / 买断</td></tr>
+  <tr><td><b>Little Snitch</b></td><td>macOS</td><td class="yes">✅ 每进程</td><td class="part">△ 窗口</td><td>付费</td></tr>
+  <tr><td><b>NetLimiter</b></td><td>Windows</td><td class="yes">✅ 每进程 + 限速</td><td class="part">△ 迷你监视器</td><td>付费</td></tr>
+  <tr><td><b>GlassWire</b></td><td>Windows / Android</td><td class="yes">✅ 每应用</td><td class="yes">✅ mini viewer</td><td>免费版可用</td></tr>
+  <tr><td><b>TrafficMonitor</b></td><td>Windows</td><td class="no">❌ 仅总速率</td><td class="yes">✅ 悬浮窗</td><td>免费开源</td></tr>
+  <tr><td><b>Netiquette</b></td><td>macOS 10.15+</td><td class="part">△ 累计字节</td><td class="no">❌</td><td>免费开源</td></tr>
+  <tr><td><b>Stats</b></td><td>macOS 12+</td><td class="no">❌ 总量为主</td><td class="part">△ 菜单栏</td><td>免费开源</td></tr>
+  <tr><td><b>bandwhich</b></td><td>macOS / Linux / Win</td><td class="yes">✅ 每进程</td><td class="no">❌ 终端 TUI</td><td>免费开源（需 sudo）</td></tr>
+  <tr><td><b>自制小球</b>（待做）</td><td>macOS</td><td class="yes">✅ Top 5</td><td class="yes">✅ 球体置顶</td><td>本地脚本，零成本</td></tr>
+</table>
+
+<h2>一、真正“悬浮置顶”的</h2>
+<div class="cards">
+  <div class="card">
+    <img src="shots/networx-floating-apps.png" alt="NetWorx 浮动应用列表">
+    <div class="body"><h3>NetWorx · 浮动应用列表 <span class="tag hot">最像加速球</span></h3>
+    <p>独立小窗常驻桌面：每个 App 的上传 / 下载实时速率。Windows 是这套 UI，macOS 版同样有浮动图表 + 应用列表。</p></div>
+  </div>
+  <div class="card">
+    <img src="shots/networx-floating-graph.png" alt="NetWorx 浮动图表">
+    <div class="body"><h3>NetWorx · 浮动图表</h3>
+    <p>同一窗口的图表视图，底部显示当前总上传 / 下载。可在菜单里切换。</p></div>
+  </div>
+  <div class="card">
+    <img src="shots/glasswire-mini-graph.png" alt="GlassWire mini viewer">
+    <div class="body"><h3>GlassWire · mini viewer</h3>
+    <p>小图钉在屏幕上（截图里叠在全屏视频上），按网络分别显示 ↓/↑。Windows / Android，有免费版。</p></div>
+  </div>
+  <div class="card">
+    <img src="shots/trafficmonitor-main.png" alt="TrafficMonitor 悬浮窗与右键菜单">
+    <div class="body"><h3>TrafficMonitor · 悬浮窗（免费开源）</h3>
+    <p>右键菜单里就是你要的那几项：<b>总是置顶 / 鼠标穿透 / 锁定窗口位置 / 不透明度</b>。但只有总网速 + CPU/内存，<b>没有进程流量排行</b>。</p></div>
+  </div>
+</div>
+
+<h2>二、macOS：菜单栏 + 每进程明细</h2>
+<div class="cards">
+  <div class="card">
+    <img src="shots/intm-menubar.png" alt="iNTM 菜单栏与弹出面板">
+    <div class="body"><h3>iNTM · 菜单栏 + 弹出面板 <span class="tag hot">macOS 首选</span></h3>
+    <p>菜单栏直接显示 <code>1.37 KB/s / 365 B/s</code>，点开就是 Upload / Download + Programs 列表（图里是 WeChat.app 的实时速率）。需要 macOS 15+。</p></div>
+  </div>
+  <div class="card">
+    <img src="shots/intm-dashboard.png" alt="iNTM 主面板">
+    <div class="body"><h3>iNTM · 主面板</h3>
+    <p>总速率、Wi-Fi 信号、公网/内网 IP、进程列表、3 分钟曲线；另有历史统计、连接列表、按 App 防火墙。</p></div>
+  </div>
+  <div class="card">
+    <img src="shots/intm-traffic.png" alt="iNTM 流量历史">
+    <div class="body"><h3>iNTM · 流量历史</h3>
+    <p>按 App 和时间段聚合，能回答“这个月谁把我的流量吃完了”。</p></div>
+  </div>
+  <div class="card">
+    <img src="shots/littlesnitch-monitor.png" alt="Little Snitch 网络监视器">
+    <div class="body"><h3>Little Snitch · 网络监视器</h3>
+    <p>左侧按 App 列流量条 + 右侧世界地图连线，底部 sent/received 汇总。偏安全审计，付费。</p></div>
+  </div>
+  <div class="card">
+    <img src="shots/netiquette-main.png" alt="Netiquette 进程连接列表">
+    <div class="body"><h3>Netiquette · 免费开源</h3>
+    <p>按进程展开 socket，带 <b>Bytes Up / Bytes Down</b> 和可执行文件路径。注意：这是<b>累计</b>字节，不是实时速率，也没有置顶悬浮。</p></div>
+  </div>
+  <div class="card">
+    <img src="shots/stats-popups.png" alt="Stats 菜单栏模块">
+    <div class="body"><h3>Stats · 免费开源菜单栏</h3>
+    <p>CPU/GPU/内存/网络/磁盘/传感器一整套。网络模块以总量与曲线为主，进程排行不是它的强项。</p></div>
+  </div>
+</div>
+
+<h2>三、Windows：进程级排行</h2>
+<div class="cards">
+  <div class="card">
+    <img src="shots/netlimiter-main.png" alt="NetLimiter 主窗口">
+    <div class="body"><h3>NetLimiter · 每进程 DL/UL 速率</h3>
+    <p>Activity 列表直接按进程给 <b>DL Rate / UL Rate</b>，右侧可加限速/阻断规则，还有 Traffic chart。</p></div>
+  </div>
+  <div class="card">
+    <img src="shots/networx-netstat.png" alt="NetWorx netstat 增强视图">
+    <div class="body"><h3>NetWorx · 增强 netstat</h3>
+    <p>进程 + 协议 + 本地/远端地址 + 状态 + Upload/Download，可按进程名过滤。</p></div>
+  </div>
+</div>
+
+<h2>四、最后做出来的东西（NetBall）</h2>
+<div class="cards">
+  <div class="card">
+    <img src="shots/app-tray.png" alt="菜单栏图标">
+    <div class="body"><h3>菜单栏图标（默认模式）<span class="tag hot">最终形态</span></h3>
+    <p>上下两行 ↓/↑ 实时速率，29×18pt，比横排窄约 2/3；深色/浅色菜单栏都适配。点图标出菜单。</p></div>
+  </div>
+  <div class="card">
+    <img src="shots/app-ball.png" alt="悬浮球">
+    <div class="body"><h3>悬浮球模式（可选）</h3>
+    <p>无边框置顶小球，显示总上下行；单击展开面板。收起态实测 12 MB / 0.9% CPU。</p></div>
+  </div>
+  <div class="card">
+    <img src="shots/app-panel.png" alt="展开面板">
+    <div class="body"><h3>展开面板：总量曲线 + 进程 Top 5</h3>
+    <p>数据源 nettop 单发快照差分（免 sudo），展开时自动切到 1 秒采样，收起回到 2 秒。</p></div>
+  </div>
+  <div class="card">
+    <img src="shots/app-live.png" alt="真实数据渲染">
+    <div class="body"><h3>真实流量（程序自渲染，非截屏）</h3>
+    <p>verge-mihomo / node / Tailscale 等真实进程在榜，37 个进程参与统计。</p></div>
+  </div>
+  <div class="card">
+    <img src="shots/design-draft.png" alt="最初的设计稿">
+    <div class="body"><h3>最早的设计稿（留作对比）</h3>
+    <p>成品基本按这张稿子实现，只是默认改成了更省的菜单栏模式。</p></div>
+  </div>
+</div>
+
+<div class="note">图片版权归各自厂商所有，此处仅用于选型对比。</div>
+</body>
+</html>

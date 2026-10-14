@@ -1,0 +1,23 @@
+# 编译产物与缓存
+build/
+.modulecache/
+NetBall.app/
+.netball.pid
+
+# 本地环境
+.venv/
+.DS_Store
+
+# 设计参考：第三方截图，仅本地比对用，版权归各自权利人，不随仓库分发
+refs/
+
+# 竞品截图：仅本地设计参考，同上，不随仓库分发
+shots/bandwhich-demo.gif
+shots/glasswire-*.png
+shots/intm-*.png
+shots/littlesnitch-*.png
+shots/netiquette-*.png
+shots/netlimiter-*.png
+shots/networx-*.png
+shots/stats-*.png
+shots/trafficmonitor-*.png
