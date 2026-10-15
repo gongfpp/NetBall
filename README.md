@@ -17,7 +17,7 @@
 - **按进程查看流量**：展开面板显示总量曲线与进程 Top 5 的实时上下行速率。
 - **可选悬浮球**：毛玻璃球或曲线胶囊，置顶显示；单击即可展开面板。
 - **轻量采样**：通过 `nettop` 单次快照计算速率，无需 `sudo` 或网络扩展；默认每 2 秒采样。
-- **代理流量识别**：支持 mihomo / Clash Verge Rev；具体条件与限制见下文。
+- **有限的代理识别**：仅使用固定的 mihomo / Clash Verge Rev 端点和进程名回退；不保证适配其他代理配置，详见下文。
 
 ## 快速开始
 
@@ -77,8 +77,7 @@ open NetBall.app    # 启动，默认使用菜单栏模式
   而弧线读的是缓动后的显示值 → 渲染出来是一条**空弧**，必须走 `updateRates`；
   ② 窗口在这个会话里没被真正合成时 `NSWindow.display()` 会被 AppKit 直接跳过，
   量出来是 0.005ms/帧 的假数——所以 `--draw-cost` 用 `cacheDisplay` 并拿 `drawCount` 对账。
-- **代理流量别想着"搬"给应用**：nettop 的归因本来就是对的（直连下载 6,160,348 字节 → 给 curl 记
-  6,216,458），真正的问题是代理核心那行把同一个字节重复记了 2~3 次。剔掉它，排行和总量同时就对了。
+- **对已测配置，过滤代理核心，而不是把流量“搬”给应用**：nettop 的归因与测试记录相符（直连下载 6,160,348 字节 → 给 curl 记 6,216,458）。混合端口下，核心与应用的同一流量可能被重复累计；在这些样本里过滤核心可减少重复计数。这不构成对其他代理或端点下总量准确性的保证。
 - **root 服务模式的代理核心，`lsof` 和 `ps` 都拿不到**（普通用户看不到它的 socket），
   只有 `pgrep -x verge-mihomo` 稳定返回 PID —— 所以核心识别的主路径是名字，不是端口。
 
@@ -100,10 +99,8 @@ open NetBall.app    # 启动，默认使用菜单栏模式
 上行那 14.3 MB/s 是**纯幽灵流量** —— curl 实际只发了 100 B/s，全都是代理核心那两条 socket 的重复计数。
 （虚高幅度随代理流量占比变化，实测 1%~64%。）
 
-**归因本身其实是对的**，不需要"搬"流量。实测：直连下载 6,160,348 字节（走 TUN），nettop 给 curl 记的是
-6,216,458；走混合端口下载 9,000,000 字节，nettop 给 curl 记 9,034,418。所以只要**把代理核心从排行和
-总量里剔掉**，数字就都对了。剩下的活是打标：问 mihomo 要连接表，把 `sourcePort` 用 `lsof` 映射回进程，
-就知道哪些应用是从代理出去的，给它们标个「代理」。
+**在这两组样本中，过滤代理核心后总量接近对应的 curl 测量值；这不保证其他代理配置也能完全校正。**
+直连下载 6,160,348 字节（走 TUN）时，nettop 给 curl 记 6,216,458；混合端口下载 9,000,000 字节时，nettop 记 9,034,418。进一步打标时，程序会从 mihomo 连接表读取 `sourcePort`，再用 `lsof` 尝试映射到进程。
 
 ```
 Google Chrome (代理)   1.4 MB/s    168 B/s
@@ -112,15 +109,18 @@ io.tailscale.ip        642 B/s     1.1 KB/s
 QQ          (代理)     531 B/s       0 B/s
 ```
 
-支持 mihomo / Clash Verge Rev：控制器端点是 Clash Verge 服务模式的 unix socket
-（`/var/run/clash-verge-service/users/<uid>/verge-mihomo.sock`），裸 mihomo 则试 `127.0.0.1:9090`。
-代理核心靠 `pgrep` 按名字识别 —— Clash Verge 用 **root 服务模式**跑 mihomo，普通用户既看不到它的 socket
-（`lsof` 无输出），`ps` 也未必能列出来，只有 `pgrep` 稳定。
+#### 识别范围与边界
 
-代价：`lsof` 一次约 0.02s CPU，所以**只在面板展开时**跑，并节流到 5s 一次；代理核心每 60s 复核一次。
-收起成球时零开销。自检：`./build/NetBall --proxy-test 8`（不用开 GUI，直接打印剔除前后的总量对比）。
+这是针对部分 mihomo / Clash Verge Rev 部署方式的**尽力而为**集成，不是通用代理探测：
 
-> 没装代理 / 不认识代理时，这套逻辑完全不介入，行为和以前一样。
+- 控制器只尝试固定位置：`/var/run/clash-verge-service/users/<uid>/verge-mihomo.sock`、`/tmp/clash-verge-service/users/<uid>/verge-mihomo.sock`、`${HOME}/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/verge-mihomo.sock`，以及裸 mihomo 常用的 `http://127.0.0.1:9090`。不会扫描任意端口或读取用户自定义端点。
+- 端点探测和 `/configs`、`/connections` 请求通过 `curl` 发出，**没有附带 API secret、token 或 Authorization 请求头**。需要鉴权、使用其他端点或找不到这些固定路径时，连接识别可能不可用。
+- 找不到控制器时，核心过滤会回退到固定进程名清单：`verge-mihomo`、`mihomo`、`clash-meta`、`clash-meta-alpha`、`sing-box`、`xray`、`v2ray`、`hysteria`、`tuic`。**清单中没有 Surge**；这不是对这些代理客户端或所有部署形态的完整支持声明。
+- 控制器可访问时，会从 `/connections` 读取 `sourcePort`，再通过 `lsof` 尝试映射到本机 PID 并加「代理」标记；权限、进程可见性或端口映射失败都可能导致漏标。
+
+因此，如果控制器未被固定端点探测到、代理核心名不在清单中，或连接无法映射，NetBall **不能保证**排除核心流量、标记代理进程或修正总速率；在这些配置下仍可能看到核心进程流量或重复计数。Clash Verge root 服务模式下，普通用户的 `lsof` / `ps` 可能看不到核心进程，程序会尝试用 `pgrep` 名称回退。
+
+代价：`lsof` 一次约 0.02s CPU，所以**只在面板展开时**跑，并节流到 5s 一次；代理核心每 60s 复核一次。收起成球时不运行连接映射。自检：`./build/NetBall --proxy-test 8`（不用开 GUI，打印剔除前后的总量对比）。
 
 ### 菜单栏样式（菜单栏图标 → 菜单栏样式）
 
@@ -237,7 +237,5 @@ rm "$HOME/Library/LaunchAgents/local.netball.plist"
 - 总速率 = 各进程增量之和；生命周期极短的进程可能漏计
 - 菜单栏图标没出现？macOS 26 新增了「系统设置 → 菜单栏」隐私开关。程序启动 2.5 秒后会自检，若图标不可见会**自动回退成「菜单栏 + 悬浮球」**，避免变成一个看不见也关不掉的隐形进程
 - 未做「鼠标穿透」：一旦开启就只能靠辅助功能权限或改配置文件关掉，风险大于收益，所以没做
-- **代理穿透只覆盖 mihomo / Clash Verge Rev**：能自动找到它的控制器（unix socket 或 9090），
-  才拿得到「哪些连接是它代理的」。换 Surge / sing-box 之类的代理，核心进程仍会按名字被剔出排行
-  （总量照样是对的），但不会打「代理」标；名字不在清单里的话连剔除都不会发生，表现和以前一样
+- **代理识别不是通用适配**：控制器只探测上文列出的固定端点，API 请求不带 secret/token；进程名回退清单虽含 `sing-box`、`xray`、`v2ray`、`hysteria`、`tuic` 等名称，但不含 `Surge`。端点、鉴权或进程名不匹配时，可能无法剔除代理核心、标记连接或校正总速率；不要据此假设使用其他代理时总量一定准确。
 - 悬浮球位置、模式、采样频率通过 `UserDefaults`（`local.netball`）持久化；若通过本仓库外的沙箱进程启动，写偏好可能被拦（正常用 `open` / Finder 启动不受影响）
