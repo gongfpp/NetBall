@@ -1592,7 +1592,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panelHoverArea = area
     }
 
-    @objc func mouseEntered(with event: NSEvent) {
+    // NSTrackingArea sends the Objective-C selector `mouseEntered:`. Swift's
+    // default selector for `mouseEntered(with:)` would be `mouseEnteredWith:`,
+    // so spell out AppKit's selector explicitly for this NSObject owner.
+    @objc(mouseEntered:) func handleMouseEntered(_ event: NSEvent) {
         let source = event.trackingArea?.userInfo?["netball.hoverSource"] as? String
         hoverHideWorkItem?.cancel()
         hoverHideWorkItem = nil
@@ -1607,7 +1610,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
     }
 
-    @objc func mouseExited(with event: NSEvent) {
+    @objc(mouseExited:) func handleMouseExited(_ event: NSEvent) {
         let source = event.trackingArea?.userInfo?["netball.hoverSource"] as? String
         guard source == "status" || source == "panel" else { return }
         if source == "status" {
