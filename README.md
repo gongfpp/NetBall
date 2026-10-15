@@ -14,10 +14,16 @@
 ## 主要功能
 
 - **菜单栏实时速率**：上下行速率常驻显示，7 种紧凑样式可选。
-- **按进程查看流量**：展开面板显示总量曲线与进程 Top 5 的实时上下行速率。
+- **总量累计统计**：展开主面板切到「统计」，查看自启动或上次重置以来的累计下行/上行字节数，并可一键重置统计周期。
+- **按进程累计统计**：同一周期内按进程名分别汇总上下行流量；同名多 PID 合并，列表按总流量排序，可滚动查看全部进程。实时排行仍可切回查看 Top 5。
 - **可选悬浮球**：毛玻璃球或曲线胶囊，置顶显示；单击即可展开面板。
 - **轻量采样**：通过 `nettop` 单次快照计算速率，无需 `sudo` 或网络扩展；默认每 2 秒采样。
 - **有限的代理识别**：仅使用固定的 mihomo / Clash Verge Rev 端点和进程名回退；不保证适配其他代理配置，详见下文。
+
+<p align="center">
+  <img src="shots/panel-stats.png" width="420" alt="统计面板：累计总流量及按进程分类的累计上下行字节数（示例数据）">
+</p>
+<p align="center"><sub>累计统计从应用启动或手动重置时开始；同名进程合并，滚动可查看完整进程列表。</sub></p>
 
 ## 快速开始
 
@@ -30,7 +36,7 @@ open NetBall.app    # 启动，默认使用菜单栏模式
 
 退出：点菜单栏图标 → **退出 NetBall**（悬浮球模式下也可右键球体）。首次构建在 macOS 上执行；本仓库没有提供 Windows/Linux 版本。
 
-> **验证边界：** 本次文档更新未在 macOS 上构建或运行 NetBall；当前环境缺少 `swift`、`swiftc` 和 `codesign`。README 中的命令与功能说明依据源码检查，不代表构建通过或实机验证。
+> **验证边界：** 1.1.0 在 macOS 上构建，并通过累计器自检与面板渲染检查；累计值来自 `nettop` 进程字节计数差分，不跨应用重启保存。
 
 ---
 
@@ -161,7 +167,7 @@ QQ          (代理)     531 B/s       0 B/s
 | 菜单栏 | 1s | 1.3% | 3.9% | ~5.2% | 13 MB |
 | 菜单栏 | 5s | 0.7% | 0.6% | **~1.3%** | 13 MB |
 | 悬浮球（收起态，弧线缓动默认开） | 2s | 1.4% | 1.8% | ~3.2% | 12 MB |
-| 悬浮球（面板展开时，含代理探测） | 2s | 1.9% | 1.9% | ~3.8% | 峰值 78 MB，收起后回落 22 MB |
+| 悬浮球（面板展开时，含代理探测与累计统计） | 2s | 2.1% | 2.2% | ~4.3% | 峰值 86 MB |
 
 复现命令：`./build/NetBall --benchmark 20 --freq 2 --tray`；悬浮球那行是 `--freq 2 --ball`。
 面板展开时弧线不参与绘制、缓动也不跑，所以那一行不受影响。
@@ -205,13 +211,15 @@ QQ          (代理)     531 B/s       0 B/s
 ```bash
 ./build/NetBall --title-probe 10                     # 逐秒打印菜单栏标题，验证数据链路
 ./build/NetBall --snapshot-live out.png --after 8    # 用真实流量渲染面板 PNG（不需要截屏权限）
-./build/NetBall --snapshot out.png --demo            # 用示例数据渲染面板 PNG
+./build/NetBall --snapshot out.png --demo            # 用示例数据渲染实时面板 PNG
+./build/NetBall --snapshot stats.png --demo --stats   # 用示例数据渲染累计统计页
 ./build/NetBall --snapshot ball.png --demo --ball    # 渲染悬浮球
 ./build/NetBall --snapshot-tray tray.png --demo      # 渲染全部菜单栏样式对照图
 ./build/NetBall --snapshot-ball ball.png --demo      # 渲染两种悬浮球样式对照图
 ./build/NetBall --fmt-test                           # 检查数值格式化长度（防止图标被裁）
 ./build/NetBall --ease-test                          # 弧线缓动自检：0.4s / 8 帧 / 单调不回跳 / 收敛停表
 ./build/NetBall --proxy-test 8                       # 代理穿透自检：剔除前后的总量对比 + 「代理」标
+./build/NetBall --stats-test                         # 累计统计：合并、排序、重置与格式自检
 ./build/NetBall --draw-cost 400                      # 单帧纯绘制成本（drawCount 对账，防止量到假数）
 ./build/NetBall --benchmark 24 --freq 1 --ball --anim-demo [--anim-off]   # 缓动的端到端 A/B
 ./build/NetBall --benchmark 20 --freq 2 [--tray|--ball] [--paused] [--collapse-after 10]
@@ -237,7 +245,8 @@ rm "$HOME/Library/LaunchAgents/local.netball.plist"
 
 ## 已知限制
 
-- 进程名沿用 nettop 的截断规则（例如 `Google Chrome H` 其实是 Chrome 的 Helper 进程）
+- 进程名沿用 nettop 的截断规则（例如 `Google Chrome H` 其实是 Chrome 的 Helper 进程）；周期统计按进程名合并同名 PID，列表可滚动查看
+- 累计统计只在本次运行中保留，从启动或手动重置开始；退出/重启应用后不持久化
 - 总速率 = 各进程增量之和；生命周期极短的进程可能漏计
 - 菜单栏图标没出现？macOS 26 新增了「系统设置 → 菜单栏」隐私开关。程序启动 2.5 秒后会自检，若图标不可见会**自动回退成「菜单栏 + 悬浮球」**，避免变成一个看不见也关不掉的隐形进程
 - 未做「鼠标穿透」：一旦开启就只能靠辅助功能权限或改配置文件关掉，风险大于收益，所以没做

@@ -1,9 +1,9 @@
 // NetBall — 常驻置顶的实时流量悬浮球（macOS 原生，AppKit + nettop）
 //
 // 设计目标：低资源占用
-//   · 单一长驻 nettop 子进程流式采样（不是每秒 fork 一次）
+//   · 按间隔运行 nettop 单发快照并差分，不保留长驻流式进程
 //   · 无 CoreAnimation 图层；只在采样时重绘，弧线 0.4s 缓动期间跑 20fps，收敛即停
-//   · 自报资源占用（自身 CPU / 内存 直接显示在面板上）
+//   · 自报资源占用（自身 CPU / 内存直接显示在面板上）
 //
 // 用法：
 //   NetBall                                  常驻悬浮球
@@ -53,6 +53,24 @@ private enum Fmt {
         if bps >= 1048576 { return (String(format: "%.1f", bps / 1048576), "MB/s") }
         if bps >= 1024 { return (String(format: "%.0f", bps / 1024), "KB/s") }
         return (String(format: "%.0f", bps), "B/s")
+    }
+
+    /// 累计流量：自适应 B → KB → MB → GB → TB（不带 /s）
+    static func bytes(_ bytes: UInt64) -> String {
+        let v = Double(bytes)
+        if v >= 1099511627776 { return String(format: "%.2f TB", v / 1099511627776) }
+        if v >= 1073741824 { return String(format: "%.2f GB", v / 1073741824) }
+        if v >= 1048576 { return String(format: "%.1f MB", v / 1048576) }
+        if v >= 1024 { return String(format: "%.1f KB", v / 1024) }
+        return "\(bytes) B"
+    }
+
+    static func duration(_ seconds: TimeInterval) -> String {
+        let s = max(0, Int(seconds))
+        let h = s / 3600, m = (s % 3600) / 60
+        if h > 0 { return "\(h)小时\(m)分" }
+        if m > 0 { return "\(m)分\((s % 60))秒" }
+        return "\(s)秒"
     }
 
     static func mb(_ bytes: UInt64) -> String { String(format: "%.0f MB", Double(bytes) / 1048576) }
@@ -106,8 +124,56 @@ final class Sampler {
         var total: Double { rx + tx }
     }
 
-    /// 回调：进程列表（按总速率降序）、总下行、总上行、进程数
-    var onSnapshot: (([Row], Double, Double, Int) -> Void)?
+    struct ProcessTotal {
+        let name: String
+        var rxBytes: UInt64
+        var txBytes: UInt64
+        var viaProxy: Bool
+        var totalBytes: UInt64 { rxBytes &+ txBytes }
+    }
+
+    struct PeriodStatistics {
+        let since: Date
+        let rxBytes: UInt64
+        let txBytes: UInt64
+        let processes: [ProcessTotal]
+    }
+
+    /// 累计器按进程名汇总：同名的多个 PID（如 Chrome Helper）归并为一行
+    struct PeriodAccumulator {
+        private(set) var since = Date()
+        private(set) var rxBytes: UInt64 = 0
+        private(set) var txBytes: UInt64 = 0
+        private var byName: [String: ProcessTotal] = [:]
+
+        mutating func add(name: String, rx: UInt64, tx: UInt64, viaProxy: Bool) {
+            rxBytes &+= rx
+            txBytes &+= tx
+            var p = byName[name] ?? ProcessTotal(name: name, rxBytes: 0, txBytes: 0, viaProxy: false)
+            p.rxBytes &+= rx
+            p.txBytes &+= tx
+            p.viaProxy = p.viaProxy || viaProxy
+            byName[name] = p
+        }
+
+        mutating func reset(at date: Date = Date()) {
+            since = date
+            rxBytes = 0
+            txBytes = 0
+            byName.removeAll(keepingCapacity: true)
+        }
+
+        func snapshot() -> PeriodStatistics {
+            let rows = byName.values.sorted {
+                $0.totalBytes == $1.totalBytes ? $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                                               : $0.totalBytes > $1.totalBytes
+            }
+            return PeriodStatistics(since: since, rxBytes: rxBytes, txBytes: txBytes, processes: rows)
+        }
+    }
+
+    /// 回调：实时排行 / 速率 / 进程数 + 自启动或重置以来的累计统计
+    var onSnapshot: (([Row], Double, Double, Int, PeriodStatistics) -> Void)?
     var deliverQueue = DispatchQueue.main
 
     private(set) var paused = false
@@ -124,6 +190,23 @@ final class Sampler {
     private var prev: [String: (UInt64, UInt64)] = [:]
     private var lastTick = Date()
     private var inFlight = false
+    private var periodAccumulator = PeriodAccumulator()
+
+    /// 读取当前统计（与采样队列串行，避免跨线程读写竞态）
+    func currentPeriodStatistics() -> PeriodStatistics {
+        queue.sync { periodAccumulator.snapshot() }
+    }
+
+    /// 从此刻重新开始统计；清空基线，避免把重置前最后一个采样间隔算进来
+    @discardableResult
+    func resetPeriodStatistics() -> PeriodStatistics {
+        queue.sync {
+            periodAccumulator.reset()
+            prev.removeAll(keepingCapacity: true)
+            lastTick = Date()
+            return periodAccumulator.snapshot()
+        }
+    }
 
     /// 代理穿透（剔除代理核心 + 给走代理的行打标）
     let proxy = ProxyProbe()
@@ -232,17 +315,21 @@ final class Sampler {
 
         for (key, v) in cur {
             guard let p = prev[key] else { continue }   // 新进程不上报第一秒的跳变
-            let dRx = Double(v.0 >= p.0 ? v.0 - p.0 : 0)
-            let dTx = Double(v.1 >= p.1 ? v.1 - p.1 : 0)
-            guard dRx + dTx > 0 else { continue }
+            let dRxBytes = v.0 >= p.0 ? v.0 - p.0 : 0
+            let dTxBytes = v.1 >= p.1 ? v.1 - p.1 : 0
+            guard dRxBytes > 0 || dTxBytes > 0 else { continue }
             guard let dot = key.lastIndex(of: "."), let pid = Int(key[key.index(after: dot)...]) else { continue }
+            let name = String(key[..<dot])
+            let dRx = Double(dRxBytes)
+            let dTx = Double(dTxBytes)
             rawRx += dRx / dt                        // 不剔除的原始总量（自检对照用）
             rawTx += dTx / dt
             guard keepProxyCore || !core.contains(pid) else { continue }
             totRx += dRx / dt
             totTx += dTx / dt
+            periodAccumulator.add(name: name, rx: dRxBytes, tx: dTxBytes, viaProxy: proxied.contains(pid))
             counted += 1
-            rows.append(Row(name: String(key[..<dot]), pid: pid, rx: dRx / dt, tx: dTx / dt,
+            rows.append(Row(name: name, pid: pid, rx: dRx / dt, tx: dTx / dt,
                             viaProxy: proxied.contains(pid)))
         }
         lastRawTotals = (rawRx, rawTx)
@@ -250,11 +337,12 @@ final class Sampler {
         rows.sort { $0.total > $1.total }
 
         let r = rows, rx = totRx, tx = totTx, n = counted
+        let period = periodAccumulator.snapshot()
         deliverQueue.async { [weak self] in
             guard let self else { return }
             // 和回调写在同一个队列上：自检里读它就一定是当前这一份，不会读到半新半旧
             self.lastRawTotals = (rawRx, rawTx)
-            self.onSnapshot?(r, rx, tx, n)
+            self.onSnapshot?(r, rx, tx, n, period)
         }
     }
 
@@ -688,6 +776,9 @@ final class BallView: NSView {
     var totalTx = 0.0
     var procCount = 0
     var history: [(rx: Double, tx: Double)] = []
+    var showPeriodStatistics = false
+    var periodStatistics = Sampler.PeriodStatistics(since: Date(), rxBytes: 0, txBytes: 0, processes: [])
+    var statisticsScrollOffset = 0
     var selfCPU = 0.0
     var selfMemMB = 0.0
     var nettopCPU = 0.0
@@ -1102,29 +1193,150 @@ final class BallView: NSView {
         text("↑ " + Fmt.rate(totalTx), x: pad, y: 42, font: fRate, color: Palette.amber,
              align: .right, boxWidth: w - 2 * pad)
 
-        drawSparkline(NSRect(x: pad, y: 78, width: w - 2 * pad, height: 56), sk: sk)
+        if showPeriodStatistics {
+            drawPeriodSummary(x: pad, width: w - 2 * pad, small: fSmall, rate: fRate, foot: fFoot)
+        } else {
+            drawSparkline(NSRect(x: pad, y: 78, width: w - 2 * pad, height: 56), sk: sk)
+        }
 
         NSColor(white: 1, alpha: 0.10).setFill()
         NSRect(x: pad, y: 146, width: w - 2 * pad, height: 1).fill()
 
-        text("进程排行", x: pad, y: 154, font: fSmall, color: Palette.dim)
+        drawPanelTab("实时", rect: liveTabRect, selected: !showPeriodStatistics, font: fSmall)
+        drawPanelTab("统计", rect: statisticsTabRect, selected: showPeriodStatistics, font: fSmall)
+        let processHeading: String
+        if showPeriodStatistics {
+            let total = periodStatistics.processes.count
+            let start = total == 0 ? 0 : min(statisticsScrollOffset + 1, total)
+            let end = min(statisticsScrollOffset + 5, total)
+            processHeading = total > 5 ? "累计 \(start)-\(end)/\(total)" : "进程累计"
+        } else {
+            processHeading = "进程排行"
+        }
+        text(processHeading, x: pad + 112, y: 154, font: fSmall, color: Palette.dim)
         text("下载", x: pad + 150, y: 154, font: fSmall, color: Palette.dim, align: .right, boxWidth: 62)
         text("上传", x: pad + 212, y: 154, font: fSmall, color: Palette.dim, align: .right, boxWidth: 68)
 
-        let top = Array(rows.prefix(5))
-        if top.isEmpty {
-            text(paused ? "采样已暂停" : "正在采样…", x: pad, y: 200, font: fRow, color: Palette.dim)
+        if showPeriodStatistics {
+            let count = periodStatistics.processes.count
+            statisticsScrollOffset = min(statisticsScrollOffset, max(0, count - 5))
+            let top = Array(periodStatistics.processes.dropFirst(statisticsScrollOffset).prefix(5))
+            if top.isEmpty {
+                text("这段期间还没有流量", x: pad, y: 202, font: fRow, color: Palette.dim)
+            } else {
+                let maxTotal = max(Double(top[0].totalBytes), 1)
+                for (i, p) in top.enumerated() {
+                    drawPeriodRow(p, index: i, y: 176 + CGFloat(i) * 46, maxTotal: maxTotal,
+                                  fRow: fRow, fVal: fVal, w: w, pad: pad, sk: sk)
+                }
+            }
         } else {
-            let maxTotal = max(top[0].total, 1)
-            for (i, r) in top.enumerated() {
-                drawRow(r, index: i, y: 172 + CGFloat(i) * 46, maxTotal: maxTotal,
-                        fRow: fRow, fVal: fVal, w: w, pad: pad, sk: sk)
+            let top = Array(rows.prefix(5))
+            if top.isEmpty {
+                text(paused ? "采樣已暫停" : "正在採樣…", x: pad, y: 200, font: fRow, color: Palette.dim)
+            } else {
+                let maxTotal = max(top[0].total, 1)
+                for (i, r) in top.enumerated() {
+                    drawRow(r, index: i, y: 176 + CGFloat(i) * 46, maxTotal: maxTotal,
+                            fRow: fRow, fVal: fVal, w: w, pad: pad, sk: sk)
+                }
             }
         }
 
         let foot = "自身 \(Fmt.pct(selfCPU)) · \(String(format: "%.0f", selfMemMB)) MB"
             + " · nettop \(Fmt.pct(nettopCPU)) · 采样 \(intervalLabel)"
         text(foot, x: pad, y: h - 22, font: fFoot, color: Palette.dim)
+    }
+
+    private var liveTabRect: NSRect { NSRect(x: Metrics.pad, y: 151, width: 50, height: 22) }
+    private var statisticsTabRect: NSRect { NSRect(x: Metrics.pad + 54, y: 151, width: 50, height: 22) }
+    private var resetStatisticsRect: NSRect {
+        NSRect(x: Metrics.panelW - Metrics.pad - 56, y: 78, width: 56, height: 22)
+    }
+
+    private func drawPanelTab(_ title: String, rect: NSRect, selected: Bool, font: NSFont) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7)
+        if selected {
+            Palette.cyan.withAlphaComponent(0.18).setFill()
+            Palette.cyan.withAlphaComponent(0.52).setStroke()
+        } else {
+            NSColor(white: 1, alpha: 0.06).setFill()
+            NSColor(white: 1, alpha: 0.12).setStroke()
+        }
+        path.lineWidth = 1
+        path.fill()
+        path.stroke()
+        text(title, x: rect.minX, y: rect.minY + 4, font: font,
+             color: selected ? Palette.cyan : Palette.dim, align: .center, boxWidth: rect.width)
+    }
+
+    private func drawPeriodSummary(x: CGFloat, width: CGFloat, small: NSFont, rate: NSFont, foot: NSFont) {
+        text("累计总流量 · 自启动/重置起", x: x, y: 80, font: small, color: Palette.dim)
+        let resetPath = NSBezierPath(roundedRect: resetStatisticsRect, xRadius: 7, yRadius: 7)
+        NSColor(white: 1, alpha: 0.07).setFill()
+        resetPath.fill()
+        NSColor(white: 1, alpha: 0.14).setStroke()
+        resetPath.lineWidth = 1
+        resetPath.stroke()
+        text("重置", x: resetStatisticsRect.minX, y: resetStatisticsRect.minY + 4,
+             font: small, color: Palette.text, align: .center, boxWidth: resetStatisticsRect.width)
+
+        text("↓ " + Fmt.bytes(periodStatistics.rxBytes), x: x, y: 100,
+             font: rate, color: Palette.cyan)
+        text("↑ " + Fmt.bytes(periodStatistics.txBytes), x: x, y: 100,
+             font: rate, color: Palette.amber, align: .right, boxWidth: width)
+        let elapsed = Date().timeIntervalSince(periodStatistics.since)
+        text("统计时长 \(Fmt.duration(elapsed)) · \(periodStatistics.processes.count) 种进程",
+             x: x, y: 128, font: foot, color: Palette.dim)
+    }
+
+    private func drawPeriodRow(_ p: Sampler.ProcessTotal, index: Int, y: CGFloat, maxTotal: Double,
+                               fRow: NSFont, fVal: NSFont, w: CGFloat, pad: CGFloat, sk: PanelSkin) {
+        let rowRect = NSRect(x: pad, y: y, width: w - 2 * pad, height: 40)
+        let rowAlpha = index < sk.rowFill.count ? sk.rowFill[index] : 0
+        if rowAlpha > 0 {
+            let rowPath = NSBezierPath(roundedRect: rowRect, xRadius: sk.rowRadius, yRadius: sk.rowRadius)
+            NSColor(white: 1, alpha: rowAlpha).setFill()
+            rowPath.fill()
+        } else {
+            NSColor(white: 1, alpha: 0.08).setFill()
+            NSRect(x: rowRect.minX, y: rowRect.minY - 3, width: rowRect.width, height: 1).fill()
+        }
+
+        let dot = NSRect(x: rowRect.minX + 12, y: rowRect.minY + 12, width: 15, height: 15)
+        Palette.iconColors[stableHash(p.name) % Palette.iconColors.count].setFill()
+        NSBezierPath(ovalIn: dot).fill()
+
+        let valX = rowRect.maxX - 12
+        let nameX = dot.maxX + 9
+        let room = max(20, valX - 148 - nameX - (p.viaProxy ? 43 : 0))
+        let shown = truncated(p.name, font: fRow, maxWidth: room)
+        let nameWidth = text(shown, x: nameX, y: rowRect.minY + 9, font: fRow, color: Palette.text)
+        if p.viaProxy {
+            let badge = NSRect(x: nameX + nameWidth + 5, y: rowRect.minY + 11, width: 34, height: 16)
+            let badgePath = NSBezierPath(roundedRect: badge, xRadius: 8, yRadius: 8)
+            Palette.cyan.withAlphaComponent(0.16).setFill()
+            badgePath.fill()
+            Palette.cyan.withAlphaComponent(0.65).setStroke()
+            badgePath.lineWidth = 1
+            badgePath.stroke()
+            text("代理", x: badge.minX + 4, y: badge.minY + 2, font: NSFont.systemFont(ofSize: 9, weight: .semibold),
+                 color: Palette.cyan)
+        }
+
+        let track = NSRect(x: rowRect.minX + 36, y: rowRect.minY + 32,
+                           width: rowRect.width - 48, height: 3)
+        NSColor(white: 1, alpha: 0.07).setFill()
+        NSBezierPath(roundedRect: track, xRadius: 1.5, yRadius: 1.5).fill()
+        let ratio = min(CGFloat(Double(p.totalBytes) / maxTotal), 1)
+        let fill = NSRect(x: track.minX, y: track.minY, width: track.width * ratio, height: track.height)
+        Palette.cyan.withAlphaComponent(0.78).setFill()
+        NSBezierPath(roundedRect: fill, xRadius: 1.5, yRadius: 1.5).fill()
+
+        text(Fmt.bytes(p.rxBytes), x: valX - 148, y: rowRect.minY + 11, font: fVal,
+             color: Palette.cyan, align: .right, boxWidth: 70)
+        text(Fmt.bytes(p.txBytes), x: valX - 70, y: rowRect.minY + 11, font: fVal,
+             color: Palette.amber, align: .right, boxWidth: 70)
     }
 
     private func drawSparkline(_ r: NSRect, sk: PanelSkin) {
@@ -1272,9 +1484,41 @@ final class BallView: NSView {
     override func mouseUp(with event: NSEvent) {
         if dragged {
             controller?.persistPosition()
-        } else {
-            controller?.toggleExpanded()
+            return
         }
+        if expanded {
+            let point = convert(event.locationInWindow, from: nil)
+            if liveTabRect.contains(point) {
+                controller?.setPeriodStatisticsVisible(false)
+                return
+            }
+            if statisticsTabRect.contains(point) {
+                controller?.setPeriodStatisticsVisible(true)
+                return
+            }
+            if showPeriodStatistics && resetStatisticsRect.contains(point) {
+                controller?.resetPeriodStatistics()
+                return
+            }
+        }
+        controller?.toggleExpanded()
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard expanded, showPeriodStatistics else {
+            super.scrollWheel(with: event)
+            return
+        }
+        let point = convert(event.locationInWindow, from: nil)
+        guard point.y >= 172 && point.y < Metrics.panelH - 24 else {
+            super.scrollWheel(with: event)
+            return
+        }
+        let maxOffset = max(0, periodStatistics.processes.count - 5)
+        guard maxOffset > 0 else { return }
+        let direction = event.scrollingDeltaY > 0 ? -1 : 1
+        statisticsScrollOffset = min(max(0, statisticsScrollOffset + direction), maxOffset)
+        needsDisplay = true
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -1371,6 +1615,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.ignoresMouseEvents = false
 
         view = BallView(frame: NSRect(origin: .zero, size: size))
+        view.periodStatistics = sampler.currentPeriodStatistics()
         view.controller = self
         window.contentView = view
         installPanelHoverTracking()
@@ -1410,7 +1655,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sampler.activeInterval = 1.0
         view.intervalLabel = "\(Int(sampler.idleInterval))s"
 
-        sampler.onSnapshot = { [weak self] rows, rx, tx, count in
+        sampler.onSnapshot = { [weak self] rows, rx, tx, count, period in
             guard let self else { return }
             self.benchmarkUpdates += 1
             self.view.intervalLabel = "\(Int(self.sampler.interval))s"
@@ -1418,6 +1663,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 ? self.sampler.childCPUSeconds / max(1, -self.startDate.timeIntervalSinceNow) * 100
                 : 0
             self.view.rows = rows
+            self.view.periodStatistics = period
             // --anim-demo：用振荡的合成速率替掉真实速率，强制每次采样都触发 0.4s 缓动，
             // 用来量"20fps 重绘"这部分的 CPU 代价（真实流量空闲时弧线根本不动，量不出来）
             let (urx, utx) = self.animDemo ? self.syntheticRates() : (rx, tx)
@@ -1781,6 +2027,18 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
                      : ballStyle.collapsedSize)
     }
 
+    func setPeriodStatisticsVisible(_ visible: Bool) {
+        view.showPeriodStatistics = visible
+        if visible { view.statisticsScrollOffset = 0 }
+        view.needsDisplay = true
+    }
+
+    func resetPeriodStatistics() {
+        view.periodStatistics = sampler.resetPeriodStatistics()
+        view.statisticsScrollOffset = 0
+        view.needsDisplay = true
+    }
+
     func resetPosition() {
         let size = window.frame.size
         window.setFrameOrigin(defaultOrigin(for: size))
@@ -1972,6 +2230,7 @@ private func renderSnapshot(to path: String, expanded: Bool, fill: (BallView) ->
     v.snapshotWhite = CommandLine.arguments.contains("--bg-white")
     v.history = []
     v.expanded = expanded
+    v.showPeriodStatistics = CommandLine.arguments.contains("--stats")
     v.ballStyle = snapStyle
     v.selfCPU = 0.4
     v.selfMemMB = 21
@@ -2268,20 +2527,23 @@ private final class LiveBox {
     private var tx = 0.0
     private var count = 0
     private var hist: [(rx: Double, tx: Double)] = []
+    private var period = Sampler.PeriodStatistics(since: Date(), rxBytes: 0, txBytes: 0, processes: [])
     /// 不剔除代理核心的原始总量（代理穿透自检做对照用）
     private var raw: (rx: Double, tx: Double) = (0, 0)
 
     func update(_ r: [Sampler.Row], _ a: Double, _ b: Double, _ c: Int,
-                raw: (rx: Double, tx: Double) = (0, 0)) {
+                raw: (rx: Double, tx: Double) = (0, 0),
+                period: Sampler.PeriodStatistics? = nil) {
         lock.lock(); defer { lock.unlock() }
         rows = r; rx = a; tx = b; count = c; self.raw = raw
+        if let period { self.period = period }
         hist.append((rx: a, tx: b))
         if hist.count > 60 { hist.removeFirst(hist.count - 60) }
     }
 
-    var snapshot: ([Sampler.Row], Double, Double, Int, [(rx: Double, tx: Double)]) {
+    var snapshot: ([Sampler.Row], Double, Double, Int, [(rx: Double, tx: Double)], Sampler.PeriodStatistics) {
         lock.lock(); defer { lock.unlock() }
-        return (rows, rx, tx, count, hist)
+        return (rows, rx, tx, count, hist, period)
     }
 
     var withRaw: (rows: [Sampler.Row], rx: Double, tx: Double, count: Int,
@@ -2296,7 +2558,9 @@ private func renderLiveSnapshot(to path: String, seconds: Double) {
     let box = LiveBox()
     let s = Sampler()
     s.deliverQueue = DispatchQueue(label: "netball.live")
-    s.onSnapshot = { rows, rx, tx, c in box.update(rows, rx, tx, c, raw: s.lastRawTotals) }
+    s.onSnapshot = { rows, rx, tx, c, period in
+        box.update(rows, rx, tx, c, raw: s.lastRawTotals, period: period)
+    }
     s.setActive(true)   // 渲染的是展开面板，按展开档跑（这样「代理」标才会出现）
     s.start()
 
@@ -2304,7 +2568,7 @@ private func renderLiveSnapshot(to path: String, seconds: Double) {
     while Date() < deadline {
         RunLoop.current.run(until: Date().addingTimeInterval(0.2))
     }
-    let (rows, rx, tx, count, hist) = box.snapshot
+    let (rows, rx, tx, count, hist, period) = box.snapshot
     s.stop()
     FileHandle.standardError.write(
         "live: rows=\(rows.count) total=\(Fmt.rate(rx))/\(Fmt.rate(tx)) procs=\(count)\n".data(using: .utf8)!)
@@ -2316,6 +2580,7 @@ private func renderLiveSnapshot(to path: String, seconds: Double) {
         v.totalTx = tx
         v.procCount = count
         v.history = hist
+        v.periodStatistics = period
         i += 1
     }
     _ = i
@@ -2362,6 +2627,26 @@ if argv.contains("--ease-test") {
     print(String(format: "      终值 %.4f（应为 %.4f）  单调不回跳=%@  收敛后 needsAnimation=%@",
                  v.shownRxLevel, expected, jumpedBack ? "否" : "是",
                  v.needsAnimation() ? "否（还在跑）" : "是（已停）"))
+    exit(0)
+}
+
+if argv.contains("--stats-test") {
+    var acc = Sampler.PeriodAccumulator()
+    let start = Date(timeIntervalSince1970: 1_800_000_000)
+    acc.reset(at: start)
+    acc.add(name: "curl", rx: 2_048, tx: 512, viaProxy: true)
+    acc.add(name: "curl", rx: 1_024, tx: 256, viaProxy: false)
+    acc.add(name: "Safari", rx: 4_096, tx: 128, viaProxy: false)
+    let sample = acc.snapshot()
+    precondition(sample.rxBytes == 7_168 && sample.txBytes == 896)
+    precondition(sample.processes.count == 2)
+    precondition(sample.processes[0].name == "Safari")
+    precondition(sample.processes[1].rxBytes == 3_072 && sample.processes[1].txBytes == 768)
+    precondition(sample.processes[1].viaProxy)
+    acc.reset(at: start.addingTimeInterval(60))
+    precondition(acc.snapshot().rxBytes == 0 && acc.snapshot().processes.isEmpty)
+    precondition(Fmt.bytes(1_536) == "1.5 KB")
+    print("统计自检通过：同名进程合并、上下行分别累计、按总流量排序、重置清零、单位格式正确")
     exit(0)
 }
 
@@ -2430,7 +2715,9 @@ if argv.contains("--proxy-test") {
     s.deliverQueue = DispatchQueue(label: "netball.proxytest")
     s.setIntervals(idle: 1.0, active: 1.0)
     s.setActive(true)
-    s.onSnapshot = { rows, rx, tx, n in box.update(rows, rx, tx, n, raw: s.lastRawTotals) }
+    s.onSnapshot = { rows, rx, tx, n, period in
+        box.update(rows, rx, tx, n, raw: s.lastRawTotals, period: period)
+    }
     s.start()
 
     var best = box.withRaw
@@ -2516,6 +2803,24 @@ if let i = argv.firstIndex(of: "--snapshot"), i + 1 < argv.count {
                 hist.append((rx: down, tx: up))
             }
             v.history = hist
+            if v.showPeriodStatistics {
+                let processes = [
+                    Sampler.ProcessTotal(name: "Google Chrome", rxBytes: 8_420_000_000, txBytes: 1_120_000_000, viaProxy: true),
+                    Sampler.ProcessTotal(name: "WeChat", rxBytes: 4_210_000_000, txBytes: 830_000_000, viaProxy: false),
+                    Sampler.ProcessTotal(name: "node", rxBytes: 2_800_000_000, txBytes: 210_000_000, viaProxy: true),
+                    Sampler.ProcessTotal(name: "Google Chrome Helper", rxBytes: 1_780_000_000, txBytes: 440_000_000, viaProxy: true),
+                    Sampler.ProcessTotal(name: "Dropbox", rxBytes: 940_000_000, txBytes: 150_000_000, viaProxy: false),
+                    Sampler.ProcessTotal(name: "Safari", rxBytes: 620_000_000, txBytes: 87_000_000, viaProxy: true),
+                    Sampler.ProcessTotal(name: "Steam Helper", rxBytes: 340_000_000, txBytes: 92_000_000, viaProxy: false),
+                    Sampler.ProcessTotal(name: "Tailscale", rxBytes: 120_000_000, txBytes: 34_000_000, viaProxy: false),
+                ]
+                v.periodStatistics = Sampler.PeriodStatistics(
+                    since: Date().addingTimeInterval(-3 * 3600 - 27 * 60),
+                    rxBytes: processes.reduce(0) { $0 &+ $1.rxBytes },
+                    txBytes: processes.reduce(0) { $0 &+ $1.txBytes },
+                    processes: processes
+                )
+            }
         }
     }
 }
