@@ -1260,6 +1260,7 @@ final class BallView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        guard controller?.isHoverPanelActive != true else { return }
         guard let win = window else { return }
         let now = NSEvent.mouseLocation
         let dx = now.x - mouseDownAt.x
@@ -1291,6 +1292,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var mode: DisplayMode = .tray
     private var statusItem: NSStatusItem?
+    private var statusHoverArea: NSTrackingArea?
+    private var panelHoverArea: NSTrackingArea?
+    private var hoverShowWorkItem: DispatchWorkItem?
+    private var hoverHideWorkItem: DispatchWorkItem?
+    private var hoverPanelActive = false
+    private var hoverPanelRestoreOrigin: NSPoint?
     private var lastRx = 0.0
     private var lastTx = 0.0
     private var lastTitleText = ""
@@ -1366,6 +1373,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view = BallView(frame: NSRect(origin: .zero, size: size))
         view.controller = self
         window.contentView = view
+        installPanelHoverTracking()
 
         let argv = argv0
         view.ballStyle = ballStyle
@@ -1521,8 +1529,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
                 item.menu = mainMenu
                 statusItem = item
+                installStatusHoverTracking()
             }
         } else if let item = statusItem {
+            if let statusHoverArea, let button = item.button {
+                button.removeTrackingArea(statusHoverArea)
+            }
+            statusHoverArea = nil
             NSStatusBar.system.removeStatusItem(item)
             statusItem = nil
         }
@@ -1554,6 +1567,133 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.image = trayIconImage(style: trayStyle, lines: trayLines(trayStyle))
         button.title = ""
         button.imagePosition = .imageOnly
+    }
+
+    // MARK: 菜单栏悬停面板
+
+    private func installStatusHoverTracking() {
+        guard let button = statusItem?.button else { return }
+        if let statusHoverArea { button.removeTrackingArea(statusHoverArea) }
+        let area = NSTrackingArea(rect: .zero,
+                                  options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  owner: self,
+                                  userInfo: ["netball.hoverSource": "status"])
+        button.addTrackingArea(area)
+        statusHoverArea = area
+    }
+
+    private func installPanelHoverTracking() {
+        guard let view else { return }
+        let area = NSTrackingArea(rect: .zero,
+                                  options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  owner: self,
+                                  userInfo: ["netball.hoverSource": "panel"])
+        view.addTrackingArea(area)
+        panelHoverArea = area
+    }
+
+    @objc func mouseEntered(with event: NSEvent) {
+        let source = event.trackingArea?.userInfo?["netball.hoverSource"] as? String
+        hoverHideWorkItem?.cancel()
+        hoverHideWorkItem = nil
+
+        guard source == "status" else { return }
+        hoverShowWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isMouseOverStatusItem() else { return }
+            self.showHoverPanel()
+        }
+        hoverShowWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+    }
+
+    @objc func mouseExited(with event: NSEvent) {
+        let source = event.trackingArea?.userInfo?["netball.hoverSource"] as? String
+        guard source == "status" || source == "panel" else { return }
+        if source == "status" {
+            hoverShowWorkItem?.cancel()
+            hoverShowWorkItem = nil
+        }
+        scheduleHoverPanelDismissal()
+    }
+
+    private func showHoverPanel() {
+        // 菜单栏模式下悬停图标打开主面板；两种展示同时启用时，离开后还原悬浮球。
+        guard mode.showsTray, !view.expanded, !hoverPanelActive else { return }
+        hoverPanelActive = true
+        hoverPanelRestoreOrigin = window.frame.origin
+        view.expanded = true
+        sampler.setActive(true)
+        resizeWindow(to: NSSize(width: Metrics.panelW, height: Metrics.panelH), persist: false)
+        positionHoverPanelUnderStatusItem()
+        window.orderFrontRegardless()
+        view.needsDisplay = true
+    }
+
+    private func scheduleHoverPanelDismissal() {
+        hoverHideWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.hoverPanelActive,
+                  !self.isMouseInsideHoverRegions() else { return }
+            self.dismissHoverPanel()
+        }
+        hoverHideWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: work)
+    }
+
+    private func dismissHoverPanel() {
+        guard hoverPanelActive else { return }
+        hoverPanelActive = false
+        hoverShowWorkItem?.cancel()
+        hoverHideWorkItem?.cancel()
+        hoverShowWorkItem = nil
+        hoverHideWorkItem = nil
+        view.expanded = false
+        sampler.setActive(false)
+        resizeWindow(to: ballStyle.collapsedSize, persist: false)
+        if let origin = hoverPanelRestoreOrigin { window.setFrameOrigin(origin) }
+        hoverPanelRestoreOrigin = nil
+        if mode.showsBall { window.orderFrontRegardless() }
+        else { window.orderOut(nil) }
+        view.needsDisplay = true
+    }
+
+    var isHoverPanelActive: Bool { hoverPanelActive }
+
+    private func positionHoverPanelUnderStatusItem() {
+        guard let button = statusItem?.button,
+              let buttonWindow = button.window else { return }
+        let buttonRectInWindow = button.convert(button.bounds, to: nil)
+        let buttonRect = buttonWindow.convertToScreen(buttonRectInWindow)
+        let screen = NSScreen.screens.first(where: { $0.frame.contains(buttonRect.origin) }) ?? NSScreen.main
+        guard let visible = screen?.visibleFrame else { return }
+        let panelSize = window.frame.size
+        let x = min(max(buttonRect.maxX - panelSize.width, visible.minX + 6),
+                    visible.maxX - panelSize.width - 6)
+        let y = visible.maxY - panelSize.height
+        window.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    private func isMouseOverStatusItem() -> Bool {
+        guard let button = statusItem?.button,
+              let buttonWindow = button.window else { return false }
+        let rect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+        return rect.contains(NSEvent.mouseLocation)
+    }
+
+    private func isMouseInsideHoverRegions() -> Bool {
+        let mouse = NSEvent.mouseLocation
+        if hoverPanelActive && window.frame.contains(mouse) { return true }
+        if let button = statusItem?.button, let buttonWindow = button.window {
+            let rect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+            if rect.contains(mouse) { return true }
+        }
+        return false
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        // 点击菜单栏图标时让原有菜单正常打开，收起临时悬停面板。
+        dismissHoverPanel()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -1609,12 +1749,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func persistPosition() {
-        guard let win = window else { return }
+        guard let win = window, !hoverPanelActive else { return }
         UserDefaults.standard.set(NSStringFromPoint(win.frame.origin), forKey: posKey)
     }
 
     /// 改变窗口尺寸：左上角保持不动，并夹在屏幕内
-    private func resizeWindow(to size: NSSize) {
+    private func resizeWindow(to size: NSSize, persist: Bool = true) {
         var f = window.frame
         let top = f.origin.y + f.size.height
         f.size = size
@@ -1626,11 +1766,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.setFrame(f, display: true)
         view.frame = NSRect(origin: .zero, size: size)
         view.needsDisplay = true
-        persistPosition()
+        if persist { persistPosition() }
     }
 
     func toggleExpanded() {
-        guard mode.showsBall else { return }   // 托盘模式下没有面板可展开
+        guard mode.showsBall, !hoverPanelActive else { return }   // 悬停面板只随指针离开收起
         view.expanded.toggle()
         sampler.setActive(view.expanded)
         resizeWindow(to: view.expanded
@@ -1770,6 +1910,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func menuSetMode(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
               let m = DisplayMode(rawValue: raw) else { return }
+        dismissHoverPanel()
         mode = m
         // 收起/隐藏期间弧线不重绘，切回悬浮球先对齐到当前值，避免闪一下旧数据
         view.settleAnimation()
