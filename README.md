@@ -1,13 +1,36 @@
-# NetBall — macOS 常驻实时流量小工具
+# NetBall
 
-对标 360 加速球的「悬浮球 + 进程流量排行」，但默认更轻：**菜单栏只显示 ↓/↑ 实时流量**，需要看是谁在耗流量时再展开面板。
+> macOS 菜单栏实时流量监控：随时看上下行速率，需要排查时再展开进程排行，也可切换为桌面悬浮球。
 
+<p align="center">
+  <img src="shots/app-panel.png" width="420" alt="NetBall 展开面板：总流量曲线与进程排行（示例数据）">
+  <img src="shots/app-ball.png" width="220" alt="NetBall 悬浮球样式（示例数据）">
+</p>
+
+<p align="center"><sub>界面预览来自仓库现有的 NetBall 程序渲染图，不是桌面截屏；图中速率为示例值，不代表当前实时流量。</sub></p>
+
+[功能概览](#主要功能) · [快速开始](#快速开始) · [已知限制](#已知限制) · [开发与自检](#自检与开发)
+
+## 主要功能
+
+- **菜单栏实时速率**：上下行速率常驻显示，7 种紧凑样式可选。
+- **按进程查看流量**：展开面板显示总量曲线与进程 Top 5 的实时上下行速率。
+- **可选悬浮球**：毛玻璃球或曲线胶囊，置顶显示；单击即可展开面板。
+- **轻量采样**：通过 `nettop` 单次快照计算速率，无需 `sudo` 或网络扩展；默认每 2 秒采样。
+- **代理流量识别**：支持 mihomo / Clash Verge Rev；具体条件与限制见下文。
+
+## 快速开始
+
+**要求：macOS 12+，以及可用的 Swift 编译器。**
+
+```bash
+./build.sh          # 编译并打包为 NetBall.app
+open NetBall.app    # 启动，默认使用菜单栏模式
 ```
-菜单栏（默认）：  ↓8.4M     ← 7 种样式随便挑，见下
-                  ↑1.2M
-点图标 → 菜单：显示模式 / 菜单栏样式 / 暂停 / 采样频率 / 退出
-悬浮球模式：      置顶小球，单击展开 = 总量曲线 + 进程 Top 5 实时上下行
-```
+
+退出：点菜单栏图标 → **退出 NetBall**（悬浮球模式下也可右键球体）。首次构建在 macOS 上执行；本仓库没有提供 Windows/Linux 版本。
+
+---
 
 ### 悬浮球样式（菜单栏图标 / 球体右键 → 悬浮球样式）
 
@@ -122,16 +145,9 @@ QQ          (代理)     531 B/s       0 B/s
 ./build/NetBall --snapshot-tray k.png --demo --values 155K,286K,441K   # 用指定数值渲染对照图
 ```
 
-## 快速开始
+## 显示模式
 
-```bash
-./build.sh          # 编译 + 打包成 NetBall.app（约 10 秒）
-open NetBall.app    # 启动，默认「菜单栏模式」，不显示悬浮球
-```
-
-退出：点菜单栏图标 → **退出 NetBall**（悬浮球模式下也可右键球体）。
-
-切换模式：菜单栏图标 → **显示模式** → `菜单栏（不显示悬浮球）` / `悬浮球` / `菜单栏 + 悬浮球`，选择会记住。
+菜单栏图标 → **显示模式** → `菜单栏（不显示悬浮球）` / `悬浮球` / `菜单栏 + 悬浮球`。选择会记住；退出时点菜单栏图标 → **退出 NetBall**（悬浮球模式下也可右键球体）。
 
 ## 资源占用（本机实测：Apple Silicon / macOS 26）
 
@@ -180,7 +196,7 @@ open NetBall.app    # 启动，默认「菜单栏模式」，不显示悬浮球
 - **单实例保护**：重复启动会直接退出，不会出现两个菜单栏图标
 - **自报开销**：展开面板底部会显示自身 CPU/内存和 nettop 的 CPU 均值，不靠嘴说
 
-## 自检 / 开发命令
+## 自检与开发
 
 ```bash
 ./build/NetBall --title-probe 10                     # 逐秒打印菜单栏标题，验证数据链路
@@ -204,7 +220,13 @@ open NetBall.app    # 启动，默认「菜单栏模式」，不显示悬浮球
 
 ```bash
 ./install-autostart.sh      # 写入 ~/Library/LaunchAgents/local.netball.plist 并加载
-./uninstall-autostart.sh    # 卸载
+```
+
+卸载自启项：
+
+```bash
+launchctl unload "$HOME/Library/LaunchAgents/local.netball.plist"
+rm "$HOME/Library/LaunchAgents/local.netball.plist"
 ```
 
 注意：自启 plist 里记的是 **当前这份 NetBall.app 的绝对路径**，移动目录后需要重新执行安装脚本。
