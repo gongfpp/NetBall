@@ -107,6 +107,188 @@ private func footprintBytes(_ pid: pid_t) -> UInt64 {
     rusageV6(pid)?.ri_phys_footprint ?? 0
 }
 
+/// 把 nettop 的通用 runtime 名称映射成可辨认的应用/项目身份。
+/// 只显示应用包名或脚本/工作目录路径；完整命令行只在内存里解析，绝不展示其余参数。
+private final class ProcessIdentityResolver {
+    struct Identity {
+        let name: String
+        let fullPath: String?
+    }
+
+    private var cache: [Int: (sourceName: String, identity: Identity)] = [:]
+
+    func retain(only pids: Set<Int>) {
+        cache = cache.filter { pids.contains($0.key) }
+    }
+
+    func resolve(_ processes: [(name: String, pid: Int)]) -> [Int: Identity] {
+        let missing = processes.filter { cache[$0.pid]?.sourceName != $0.name }
+        let electronProcesses = missing.filter { Self.isElectron($0.name) }
+        let nodeProcesses = missing.filter { Self.isNode($0.name) }
+
+        for process in electronProcesses {
+            let executable = Self.executablePath(pid: process.pid)
+            let bundlePath = executable.flatMap(Self.outermostAppBundlePath(from:))
+            let appBundle = bundlePath.flatMap { Bundle(url: URL(fileURLWithPath: $0)) }
+            let appName = appBundle?.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+                ?? appBundle?.object(forInfoDictionaryKey: "CFBundleName") as? String
+                ?? NSRunningApplication(processIdentifier: pid_t(process.pid))?.localizedName
+            let name = appName.flatMap { Self.isUsefulAppName($0) ? $0 : nil }
+                ?? bundlePath.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent }
+                ?? process.name
+            let fullPath = bundlePath ?? executable
+            cache[process.pid] = (process.name, Identity(name: name, fullPath: fullPath))
+        }
+
+        if !nodeProcesses.isEmpty {
+            let cwdByPID = Self.workingDirectories(pids: nodeProcesses.map(\.pid))
+            let commandByPID = Self.commandLines(pids: nodeProcesses.map(\.pid))
+            for process in nodeProcesses {
+                let cwd = cwdByPID[process.pid]
+                let executable = Self.executablePath(pid: process.pid)
+                let script = Self.nodeEntrypoint(from: commandByPID[process.pid], workingDirectory: cwd)
+                let projectDirectory = Self.projectDirectory(for: script, workingDirectory: cwd)
+                let location = projectDirectory ?? script ?? cwd ?? executable
+                let label: String
+                if let projectDirectory {
+                    label = "node · \(URL(fileURLWithPath: projectDirectory).lastPathComponent)"
+                } else if let script {
+                    label = "node · \(URL(fileURLWithPath: script).lastPathComponent)"
+                } else if let cwd {
+                    label = "node · \(URL(fileURLWithPath: cwd).lastPathComponent)"
+                } else {
+                    label = process.name
+                }
+                cache[process.pid] = (process.name, Identity(name: label, fullPath: location))
+            }
+        }
+
+        return Dictionary(uniqueKeysWithValues: processes.compactMap { process in
+            guard let entry = cache[process.pid], entry.sourceName == process.name else { return nil }
+            return (process.pid, entry.identity)
+        })
+    }
+
+    static func isElectron(_ name: String) -> Bool {
+        name.localizedCaseInsensitiveContains("electron")
+    }
+
+    static func isNode(_ name: String) -> Bool {
+        ["node", "nodejs"].contains(name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }
+
+    static func outermostAppBundlePath(from executablePath: String) -> String? {
+        var current = URL(fileURLWithPath: executablePath).standardizedFileURL
+        var outermost: URL?
+        while current.path != "/" {
+            if current.pathExtension.lowercased() == "app" { outermost = current }
+            current.deleteLastPathComponent()
+        }
+        return outermost?.path
+    }
+
+    /// 从 Node 启动参数中只取入口脚本路径；忽略 `-e`、预加载脚本及包管理器自身入口。
+    static func nodeEntrypoint(from commandLine: String?, workingDirectory: String?) -> String? {
+        guard let commandLine else { return nil }
+        let tokens = commandLine.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard tokens.count > 1 else { return nil }
+        let valueFlags: Set<String> = ["-r", "--require", "--import", "--loader", "--experimental-loader",
+                                       "--conditions", "--inspect-port", "--title"]
+        let scriptExtensions: Set<String> = ["js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts"]
+        var i = 1
+        while i < tokens.count {
+            let token = unquote(tokens[i])
+            if token == "-e" || token == "--eval" { return nil }
+            if valueFlags.contains(token) { i += 2; continue }
+            if token.hasPrefix("--require=") || token.hasPrefix("--import=")
+                || token.hasPrefix("--loader=") { i += 1; continue }
+            if token.hasPrefix("-") { i += 1; continue }
+
+            let last = min(tokens.count - 1, i + 10)
+            for end in i...last {
+                let candidate = unquote(tokens[i...end].joined(separator: " "))
+                let ext = URL(fileURLWithPath: candidate).pathExtension.lowercased()
+                let isBinScript = candidate.contains("/node_modules/.bin/")
+                guard scriptExtensions.contains(ext) || isBinScript else { continue }
+                let normalized = absolutePath(candidate, workingDirectory: workingDirectory)
+                if isPackageManagerBootstrap(normalized) { continue }
+                return normalized
+            }
+            i += 1
+        }
+        return nil
+    }
+
+    static func projectDirectory(for script: String?, workingDirectory: String?) -> String? {
+        guard let script, let workingDirectory else { return nil }
+        let cwd = URL(fileURLWithPath: workingDirectory).standardizedFileURL.path
+        return script.hasPrefix(cwd + "/node_modules/") ? cwd : nil
+    }
+
+    static func isPackageManagerBootstrap(_ path: String) -> Bool {
+        let normalized = path.lowercased()
+        return normalized.contains("/node_modules/npm/bin/npm-cli.js")
+            || normalized.contains("/node_modules/pnpm/bin/pnpm.cjs")
+            || normalized.contains("/node_modules/yarn/bin/yarn.js")
+    }
+
+    private static func isUsefulAppName(_ name: String) -> Bool {
+        !name.isEmpty && !name.localizedCaseInsensitiveContains("electron")
+            && !name.localizedCaseInsensitiveContains("helper")
+    }
+
+    private static func unquote(_ value: String) -> String {
+        value.trimmingCharacters(in: CharacterSet(charactersIn: "\\\"'"))
+    }
+
+    private static func absolutePath(_ path: String, workingDirectory: String?) -> String {
+        let expanded = NSString(string: path).expandingTildeInPath
+        guard !expanded.hasPrefix("/") else {
+            return URL(fileURLWithPath: expanded).standardizedFileURL.path
+        }
+        guard let workingDirectory else { return expanded }
+        return URL(fileURLWithPath: expanded, relativeTo: URL(fileURLWithPath: workingDirectory, isDirectory: true))
+            .standardizedFileURL.path
+    }
+
+    private static func executablePath(pid: Int) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        let size = proc_pidpath(pid_t(pid), &buffer, UInt32(buffer.count))
+        guard size > 0 else { return nil }
+        return String(cString: buffer)
+    }
+
+    private static func commandLines(pids: [Int]) -> [Int: String] {
+        guard !pids.isEmpty,
+              let output = runTool("/bin/ps", ["-ww", "-p", pids.map { String($0) }.joined(separator: ","), "-o", "pid=,command="]) else {
+            return [:]
+        }
+        var result: [Int: String] = [:]
+        for line in output.split(separator: "\n") {
+            let fields = line.split(maxSplits: 1, omittingEmptySubsequences: true, whereSeparator: \.isWhitespace)
+            guard fields.count == 2, let pid = Int(fields[0]) else { continue }
+            result[pid] = String(fields[1])
+        }
+        return result
+    }
+
+    private static func workingDirectories(pids: [Int]) -> [Int: String] {
+        guard !pids.isEmpty,
+              let output = runTool("/usr/sbin/lsof", ["-a", "-p", pids.map { String($0) }.joined(separator: ","), "-d", "cwd", "-Fn"]) else {
+            return [:]
+        }
+        var result: [Int: String] = [:]
+        var currentPID: Int?
+        for line in output.split(separator: "\n") {
+            if line.first == "p" { currentPID = Int(line.dropFirst()) }
+            else if line.first == "n", let currentPID {
+                result[currentPID] = String(line.dropFirst())
+            }
+        }
+        return result
+    }
+}
+
 // MARK: - 采样器
 //
 // 为什么不用 `nettop -l 0` 长驻流式：实测它在两次采样之间忙等，持续吃掉 1.0~1.4 个核
@@ -119,6 +301,8 @@ final class Sampler {
         let pid: Int
         let rx: Double  // bytes/s 下行
         let tx: Double  // bytes/s 上行
+        /// 只为 Electron / Node 补充应用包、入口脚本或工作目录路径
+        var fullPath: String? = nil
         /// 这条流量是经代理出去的（ProxyProbe 打标）
         var viaProxy = false
         var total: Double { rx + tx }
@@ -129,7 +313,9 @@ final class Sampler {
         var rxBytes: UInt64
         var txBytes: UInt64
         var viaProxy: Bool
+        var fullPath: String? = nil
         var totalBytes: UInt64 { rxBytes &+ txBytes }
+        var identityKey: String { name + "\u{0}" + (fullPath ?? "") }
     }
 
     struct StatisticsSortState {
@@ -161,39 +347,44 @@ final class Sampler {
                 let secondaryA = byUpload ? a.rxBytes : a.txBytes
                 let secondaryB = byUpload ? b.rxBytes : b.txBytes
                 if secondaryA != secondaryB { return secondaryA > secondaryB }
-                return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+                let nameOrder = a.name.localizedCaseInsensitiveCompare(b.name)
+                if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+                return (a.fullPath ?? "").localizedCaseInsensitiveCompare(b.fullPath ?? "") == .orderedAscending
             }
         }
     }
 
-    /// 累计器按进程名汇总：同名的多个 PID（如 Chrome Helper）归并为一行
+    /// 累计器按应用/项目身份汇总；同一 Electron 包或 Node 入口的多个 PID 仍归并一行。
     struct PeriodAccumulator {
         private(set) var since = Date()
         private(set) var rxBytes: UInt64 = 0
         private(set) var txBytes: UInt64 = 0
-        private var byName: [String: ProcessTotal] = [:]
+        private var byIdentity: [String: ProcessTotal] = [:]
 
-        mutating func add(name: String, rx: UInt64, tx: UInt64, viaProxy: Bool) {
+        mutating func add(name: String, rx: UInt64, tx: UInt64, viaProxy: Bool, fullPath: String? = nil) {
             rxBytes &+= rx
             txBytes &+= tx
-            var p = byName[name] ?? ProcessTotal(name: name, rxBytes: 0, txBytes: 0, viaProxy: false)
+            let identity = ProcessTotal(name: name, rxBytes: 0, txBytes: 0, viaProxy: false, fullPath: fullPath)
+            var p = byIdentity[identity.identityKey] ?? identity
             p.rxBytes &+= rx
             p.txBytes &+= tx
             p.viaProxy = p.viaProxy || viaProxy
-            byName[name] = p
+            byIdentity[identity.identityKey] = p
         }
 
         mutating func reset(at date: Date = Date()) {
             since = date
             rxBytes = 0
             txBytes = 0
-            byName.removeAll(keepingCapacity: true)
+            byIdentity.removeAll(keepingCapacity: true)
         }
 
         func snapshot() -> PeriodStatistics {
-            let rows = byName.values.sorted {
-                $0.totalBytes == $1.totalBytes ? $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
-                                               : $0.totalBytes > $1.totalBytes
+            let rows = byIdentity.values.sorted {
+                if $0.totalBytes != $1.totalBytes { return $0.totalBytes > $1.totalBytes }
+                let nameOrder = $0.name.localizedCaseInsensitiveCompare($1.name)
+                if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+                return ($0.fullPath ?? "").localizedCaseInsensitiveCompare($1.fullPath ?? "") == .orderedAscending
             }
             return PeriodStatistics(since: since, rxBytes: rxBytes, txBytes: txBytes, processes: rows)
         }
@@ -218,6 +409,7 @@ final class Sampler {
     private var lastTick = Date()
     private var inFlight = false
     private var periodAccumulator = PeriodAccumulator()
+    private let processIdentityResolver = ProcessIdentityResolver()
 
     /// 读取当前统计（与采样队列串行，避免跨线程读写竞态）
     func currentPeriodStatistics() -> PeriodStatistics {
@@ -315,6 +507,11 @@ final class Sampler {
             guard let parsed = Sampler.parse(String(line)) else { continue }
             cur[parsed.key] = (parsed.rx, parsed.tx)
         }
+        let livePIDs = Set(cur.keys.compactMap { key -> Int? in
+            guard let dot = key.lastIndex(of: ".") else { return nil }
+            return Int(key[key.index(after: dot)...])
+        })
+        processIdentityResolver.retain(only: livePIDs)
         guard !cur.isEmpty else { return }
 
         let now = Date()
@@ -338,7 +535,7 @@ final class Sampler {
         if active { proxy.refreshProxiedIfNeeded() }
         let core = proxy.corePIDs
         let proxied = proxy.proxiedPIDs
-        var counted = 0
+        var traffic: [(name: String, pid: Int, rx: UInt64, tx: UInt64, viaProxy: Bool)] = []
 
         for (key, v) in cur {
             guard let p = prev[key] else { continue }   // 新进程不上报第一秒的跳变
@@ -354,11 +551,20 @@ final class Sampler {
             guard keepProxyCore || !core.contains(pid) else { continue }
             totRx += dRx / dt
             totTx += dTx / dt
-            periodAccumulator.add(name: name, rx: dRxBytes, tx: dTxBytes, viaProxy: proxied.contains(pid))
-            counted += 1
-            rows.append(Row(name: name, pid: pid, rx: dRx / dt, tx: dTx / dt,
-                            viaProxy: proxied.contains(pid)))
+            traffic.append((name, pid, dRxBytes, dTxBytes, proxied.contains(pid)))
         }
+
+        let identities = processIdentityResolver.resolve(traffic.map { (name: $0.name, pid: $0.pid) })
+        for item in traffic {
+            let identity = identities[item.pid]
+                ?? ProcessIdentityResolver.Identity(name: item.name, fullPath: nil)
+            periodAccumulator.add(name: identity.name, rx: item.rx, tx: item.tx,
+                                  viaProxy: item.viaProxy, fullPath: identity.fullPath)
+            rows.append(Row(name: identity.name, pid: item.pid,
+                            rx: Double(item.rx) / dt, tx: Double(item.tx) / dt,
+                            fullPath: identity.fullPath, viaProxy: item.viaProxy))
+        }
+        let counted = traffic.count
         lastRawTotals = (rawRx, rawTx)
         prev = cur
         rows.sort { $0.total > $1.total }
@@ -1355,11 +1561,14 @@ final class BallView: NSView {
 
         let valX = rowRect.maxX - 12
         let nameX = dot.maxX + 9
-        let room = max(20, valX - 148 - nameX - (p.viaProxy ? 43 : 0))
-        let shown = truncated(p.name, font: fRow, maxWidth: room)
-        let nameWidth = text(shown, x: nameX, y: rowRect.minY + 9, font: fRow, color: Palette.text)
+        let labelRoom = max(20, valX - 148 - nameX)
+        let nameRoom = max(20, labelRoom - (p.viaProxy ? 43 : 0))
+        let hasDetail = p.fullPath != nil
+        let nameY = rowRect.minY + (hasDetail ? 4 : 9)
+        let shown = truncated(p.name, font: fRow, maxWidth: nameRoom)
+        let nameWidth = text(shown, x: nameX, y: nameY, font: fRow, color: Palette.text)
         if p.viaProxy {
-            let badge = NSRect(x: nameX + nameWidth + 5, y: rowRect.minY + 11, width: 34, height: 16)
+            let badge = NSRect(x: nameX + nameWidth + 5, y: nameY + 2, width: 34, height: 16)
             let badgePath = NSBezierPath(roundedRect: badge, xRadius: 8, yRadius: 8)
             Palette.cyan.withAlphaComponent(0.16).setFill()
             badgePath.fill()
@@ -1369,8 +1578,12 @@ final class BallView: NSView {
             text("代理", x: badge.minX + 4, y: badge.minY + 2, font: NSFont.systemFont(ofSize: 9, weight: .semibold),
                  color: Palette.cyan)
         }
+        if let fullPath = p.fullPath {
+            drawIdentityPath(fullPath, x: nameX, y: rowRect.minY + 20, maxWidth: labelRoom)
+        }
 
-        let track = NSRect(x: rowRect.minX + 36, y: rowRect.minY + 32,
+        let trackY = rowRect.minY + (hasDetail ? 35 : 32)
+        let track = NSRect(x: rowRect.minX + 36, y: trackY,
                            width: rowRect.width - 48, height: 3)
         NSColor(white: 1, alpha: 0.07).setFill()
         NSBezierPath(roundedRect: track, xRadius: 1.5, yRadius: 1.5).fill()
@@ -1439,23 +1652,27 @@ final class BallView: NSView {
 
         let nameX = dot.maxX + 9
         let valX = rowRect.maxX - 12
+        let labelRoom = max(20, valX - 148 - nameX)
+        let fBadge = NSFont.systemFont(ofSize: 9.5, weight: .semibold)
+        let badgeW = ("代理" as NSString).size(withAttributes: [.font: fBadge]).width + 11
+        let nameRoom = max(20, labelRoom - (r.viaProxy ? badgeW + 12 : 0))
+        let hasDetail = r.fullPath != nil
+        let nameY = rowRect.minY + (hasDetail ? 4 : 11)
+        let shown = truncated(r.name, font: fRow, maxWidth: nameRoom)
+        let nameWidth = text(shown, x: nameX, y: nameY, font: fRow, color: Palette.text)
         if r.viaProxy {
             // 行尾标「代理」：告诉用户这条流量是从代理出去的（不是直连）
-            let fBadge = NSFont.systemFont(ofSize: 9.5, weight: .semibold)
-            let badgeW = ("代理" as NSString).size(withAttributes: [.font: fBadge]).width + 11
-            let room = (valX - 148) - nameX - 6            // 值列左边的可用宽度
-            let shown = truncated(r.name, font: fRow, maxWidth: room - badgeW - 6)
-            let nw = text(shown, x: nameX, y: rowRect.minY + 11, font: fRow, color: Palette.text)
-            let br = NSRect(x: nameX + nw + 6, y: rowRect.minY + 13, width: badgeW, height: 14)
+            let br = NSRect(x: nameX + nameWidth + 6, y: nameY + 2, width: badgeW, height: 14)
             let path = NSBezierPath(roundedRect: br, xRadius: 7, yRadius: 7)
             Palette.cyan.withAlphaComponent(0.16).setFill()
             path.fill()
             Palette.cyan.withAlphaComponent(0.7).setStroke()
             path.lineWidth = 1
             path.stroke()
-            text("代理", x: br.minX + 5.5, y: rowRect.minY + 14.5, font: fBadge, color: Palette.cyan)
-        } else {
-            text(r.name, x: nameX, y: rowRect.minY + 11, font: fRow, color: Palette.text)
+            text("代理", x: br.minX + 5.5, y: br.minY + 1, font: fBadge, color: Palette.cyan)
+        }
+        if let fullPath = r.fullPath {
+            drawIdentityPath(fullPath, x: nameX, y: rowRect.minY + 20, maxWidth: labelRoom)
         }
 
         text(Fmt.rate(r.rx), x: valX - 148, y: rowRect.minY + 12, font: fVal, color: Palette.cyan,
@@ -1468,7 +1685,8 @@ final class BallView: NSView {
         let barW = (w - 2 * pad - 40) * frac
         if barW > 1 {
             let h: CGFloat = 3
-            let bar = NSBezierPath(roundedRect: NSRect(x: dot.maxX + 9, y: rowRect.maxY - 12,
+            let barY = rowRect.minY + (hasDetail ? 35 : 28)
+            let bar = NSBezierPath(roundedRect: NSRect(x: dot.maxX + 9, y: barY,
                                                        width: barW, height: h),
                                    xRadius: h / 2, yRadius: h / 2)
             Palette.cyan.withAlphaComponent(0.75).setFill()
@@ -1490,6 +1708,28 @@ final class BallView: NSView {
         }
         str.draw(at: NSPoint(x: px, y: y))
         return size.width
+    }
+
+    private func drawIdentityPath(_ path: String, x: CGFloat, y: CGFloat, maxWidth: CGFloat) {
+        let font = NSFont.systemFont(ofSize: 9, weight: .regular)
+        text(shortenedPath(path, font: font, maxWidth: maxWidth),
+             x: x, y: y, font: font, color: Palette.dim)
+    }
+
+    private func shortenedPath(_ path: String, font: NSFont, maxWidth: CGFloat) -> String {
+        let home = NSHomeDirectory()
+        let displayPath: String
+        if path == home { displayPath = "~" }
+        else if path.hasPrefix(home + "/") { displayPath = "~/" + String(path.dropFirst(home.count + 1)) }
+        else { displayPath = path }
+        let attrs: [NSAttributedString.Key: Any] = [.font: font]
+        if (displayPath as NSString).size(withAttributes: attrs).width <= maxWidth { return displayPath }
+        let chars = Array(displayPath)
+        for start in 0..<chars.count {
+            let candidate = "…" + String(chars.dropFirst(start))
+            if (candidate as NSString).size(withAttributes: attrs).width <= maxWidth { return candidate }
+        }
+        return "…"
     }
 
     /// 名字太长就截断加省略号——给行尾的「代理」标腾地方
@@ -1560,7 +1800,10 @@ final class BallView: NSView {
 
     override func resetCursorRects() {
         super.resetCursorRects()
+        removeAllToolTips()
         guard expanded else { return }
+        addToolTip(NSRect(x: Metrics.pad, y: 172, width: Metrics.panelW - 2 * Metrics.pad, height: 232),
+                       owner: self, userData: nil)
         addCursorRect(liveTabRect, cursor: .pointingHand)
         addCursorRect(statisticsTabRect, cursor: .pointingHand)
         if showPeriodStatistics {
@@ -1568,6 +1811,28 @@ final class BallView: NSView {
             addCursorRect(downloadSortRect, cursor: .pointingHand)
             addCursorRect(uploadSortRect, cursor: .pointingHand)
         }
+    }
+
+    @objc func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag,
+                    point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
+        guard view === self, expanded else { return "" }
+        let offset = point.y - 176
+        guard offset >= 0 else { return "" }
+        let index = Int(offset / 46)
+        let withinRow = offset - CGFloat(index) * 46
+        guard index < 5, withinRow < 40 else { return "" }
+
+        let fullPath: String?
+        if showPeriodStatistics {
+            let sorted = periodStatistics.sortedProcesses(
+                byUpload: statisticsSort.column == .upload, ascending: statisticsSort.ascending)
+            let processIndex = statisticsScrollOffset + index
+            fullPath = processIndex < sorted.count ? sorted[processIndex].fullPath : nil
+        } else {
+            fullPath = index < rows.count ? rows[index].fullPath : nil
+        }
+        guard let fullPath else { return "" }
+        return "完整路径：\n\(fullPath)"
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -2724,7 +2989,62 @@ if argv.contains("--stats-test") {
     acc.reset(at: start.addingTimeInterval(60))
     precondition(acc.snapshot().rxBytes == 0 && acc.snapshot().processes.isEmpty)
     precondition(Fmt.bytes(1_536) == "1.5 KB")
-    print("统计自检通过：同名进程合并、上下行分别累计、下载/上传排序与升降序切换、重置清零、单位格式正确")
+
+    var identities = Sampler.PeriodAccumulator()
+    identities.add(name: "Visual Studio Code", rx: 100, tx: 10, viaProxy: false,
+                   fullPath: "/Applications/Visual Studio Code.app")
+    identities.add(name: "Visual Studio Code", rx: 200, tx: 20, viaProxy: true,
+                   fullPath: "/Applications/Visual Studio Code.app")
+    identities.add(name: "Visual Studio Code", rx: 50, tx: 5, viaProxy: false,
+                   fullPath: "/Applications/VS Code Insiders.app")
+    identities.add(name: "node · server.js", rx: 30, tx: 3, viaProxy: false,
+                   fullPath: "/Users/me/Project A/server.js")
+    identities.add(name: "node · server.js", rx: 40, tx: 4, viaProxy: false,
+                   fullPath: "/Users/me/Project B/server.js")
+    let identityRows = identities.snapshot().processes
+    precondition(identityRows.count == 4)
+    precondition(identityRows.first(where: { $0.fullPath == "/Applications/Visual Studio Code.app" })?.rxBytes == 300)
+    precondition(identityRows.first(where: { $0.fullPath == "/Applications/Visual Studio Code.app" })?.viaProxy == true)
+
+    precondition(ProcessIdentityResolver.isElectron("Electron Helper"))
+    precondition(ProcessIdentityResolver.isNode("node"))
+    precondition(ProcessIdentityResolver.outermostAppBundlePath(
+        from: "/Applications/Editor.app/Contents/Frameworks/Helper.app/Contents/MacOS/Electron")
+        == "/Applications/Editor.app")
+    precondition(ProcessIdentityResolver.nodeEntrypoint(
+        from: "/opt/homebrew/bin/node /Users/me/Dev/My Project/src/server.ts --port 3000",
+        workingDirectory: "/Users/me") == "/Users/me/Dev/My Project/src/server.ts")
+    precondition(ProcessIdentityResolver.nodeEntrypoint(
+        from: "/opt/homebrew/bin/node --require /Users/me/hook.js /Users/me/app/main.js",
+        workingDirectory: "/Users/me") == "/Users/me/app/main.js")
+    precondition(ProcessIdentityResolver.nodeEntrypoint(
+        from: "/opt/homebrew/bin/node /opt/node/lib/node_modules/npm/bin/npm-cli.js run start",
+        workingDirectory: "/Users/me/app") == nil)
+    precondition(ProcessIdentityResolver.nodeEntrypoint(
+        from: "/opt/homebrew/bin/node -e 'console.log(1)'", workingDirectory: "/Users/me/app") == nil)
+    precondition(ProcessIdentityResolver.projectDirectory(
+        for: "/Users/me/app/node_modules/next/dist/server.js", workingDirectory: "/Users/me/app")
+        == "/Users/me/app")
+    precondition(ProcessIdentityResolver.projectDirectory(
+        for: "/Users/me/shared/server.js", workingDirectory: "/Users/me/app") == nil)
+
+    let tooltipView = BallView(frame: NSRect(x: 0, y: 0, width: Metrics.panelW, height: Metrics.panelH))
+    tooltipView.expanded = true
+    tooltipView.rows = [Sampler.Row(name: "node · server.js", pid: 1, rx: 10, tx: 0,
+                                    fullPath: "/Users/me/Project/server.js")]
+    let liveTooltip = tooltipView.view(tooltipView, stringForToolTip: 0,
+                                       point: NSPoint(x: 60, y: 180), userData: nil)
+    precondition(liveTooltip == "完整路径：\n/Users/me/Project/server.js")
+    tooltipView.showPeriodStatistics = true
+    tooltipView.periodStatistics = Sampler.PeriodStatistics(
+        since: Date(), rxBytes: 10, txBytes: 0,
+        processes: [Sampler.ProcessTotal(name: "node · server.js", rxBytes: 10, txBytes: 0,
+                                         viaProxy: false, fullPath: "/Users/me/Project/server.js")])
+    let statisticsTooltip = tooltipView.view(tooltipView, stringForToolTip: 0,
+                                              point: NSPoint(x: 60, y: 180), userData: nil)
+    precondition(statisticsTooltip == "完整路径：\n/Users/me/Project/server.js")
+
+    print("统计/身份自检通过：同进程身份聚合、不同应用/脚本路径分组、Electron 包路径识别、Node 入口提取、命令行参数隐去、实时/累计路径提示、累计与排序/重置")
     exit(0)
 }
 
@@ -2869,8 +3189,10 @@ if let i = argv.firstIndex(of: "--snapshot"), i + 1 < argv.count {
             v.rows = [
                 Sampler.Row(name: "Google Chrome", pid: 45565, rx: mb(5.8), tx: kb(120), viaProxy: true),
                 Sampler.Row(name: "WeChat", pid: 52526, rx: mb(1.6), tx: kb(340)),
-                Sampler.Row(name: "node", pid: 798, rx: kb(210), tx: kb(64), viaProxy: true),
-                Sampler.Row(name: "Google Chrome Helper", pid: 45599, rx: kb(96), tx: kb(18), viaProxy: true),
+                Sampler.Row(name: "node · server.js", pid: 798, rx: kb(210), tx: kb(64),
+                            fullPath: NSHomeDirectory() + "/Developer/demo-api/server.js", viaProxy: true),
+                Sampler.Row(name: "Visual Studio Code", pid: 45599, rx: kb(96), tx: kb(18),
+                            fullPath: "/Applications/Visual Studio Code.app", viaProxy: true),
                 Sampler.Row(name: "Dropbox", pid: 900, rx: kb(88), tx: kb(12)),
             ]
             var hist: [(rx: Double, tx: Double)] = []
@@ -2885,8 +3207,10 @@ if let i = argv.firstIndex(of: "--snapshot"), i + 1 < argv.count {
                 let processes = [
                     Sampler.ProcessTotal(name: "Google Chrome", rxBytes: 8_420_000_000, txBytes: 1_120_000_000, viaProxy: true),
                     Sampler.ProcessTotal(name: "WeChat", rxBytes: 4_210_000_000, txBytes: 830_000_000, viaProxy: false),
-                    Sampler.ProcessTotal(name: "node", rxBytes: 2_800_000_000, txBytes: 210_000_000, viaProxy: true),
-                    Sampler.ProcessTotal(name: "Google Chrome Helper", rxBytes: 1_780_000_000, txBytes: 440_000_000, viaProxy: true),
+                    Sampler.ProcessTotal(name: "node · web-app", rxBytes: 2_800_000_000, txBytes: 210_000_000, viaProxy: true,
+                                          fullPath: NSHomeDirectory() + "/Developer/web-app"),
+                    Sampler.ProcessTotal(name: "Visual Studio Code", rxBytes: 1_780_000_000, txBytes: 440_000_000, viaProxy: true,
+                                          fullPath: "/Applications/Visual Studio Code.app"),
                     Sampler.ProcessTotal(name: "Dropbox", rxBytes: 940_000_000, txBytes: 150_000_000, viaProxy: false),
                     Sampler.ProcessTotal(name: "Safari", rxBytes: 620_000_000, txBytes: 87_000_000, viaProxy: true),
                     Sampler.ProcessTotal(name: "Steam Helper", rxBytes: 340_000_000, txBytes: 92_000_000, viaProxy: false),
