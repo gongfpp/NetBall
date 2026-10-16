@@ -1906,6 +1906,28 @@ final class BallView: NSView {
     }
 }
 
+// Status-item tracking callbacks can be dropped while macOS switches menu-bar window state.
+// A small run-loop poll provides a fallback, with the same short dwell as mouseEntered:.
+struct StatusHoverDwellState {
+    private var startedAt: TimeInterval?
+
+    mutating func update(isHovering: Bool, now: TimeInterval, delay: TimeInterval = 0.12) -> Bool {
+        guard isHovering else {
+            startedAt = nil
+            return false
+        }
+        guard let startedAt else {
+            self.startedAt = now
+            return false
+        }
+        guard now - startedAt >= delay else { return false }
+        self.startedAt = nil
+        return true
+    }
+
+    mutating func reset() { startedAt = nil }
+}
+
 // MARK: - 控制器
 
 final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -1919,6 +1941,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var panelHoverArea: NSTrackingArea?
     private var hoverShowWorkItem: DispatchWorkItem?
     private var hoverHideWorkItem: DispatchWorkItem?
+    private var statusHoverWatchTimer: Timer?
+    private var statusHoverDwell = StatusHoverDwellState()
     private var hoverPanelActive = false
     private var hoverPanelRestoreOrigin: NSPoint?
     private var lastRx = 0.0
@@ -2009,6 +2033,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         else if argv.contains("--ball") { mode = .ball }
         else { mode = DisplayMode.load() }
         applyMode()
+        startStatusHoverWatchdog()
 
         // 安全兜底：macOS 26 的「菜单栏」隐私开关可能把图标藏起来，
         // 若 2.5 秒后图标仍不可见，就回退成「菜单栏 + 悬浮球」，免得变成一个看不见也关不掉的进程。
@@ -2195,6 +2220,36 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: 菜单栏悬停面板
+
+    private func startStatusHoverWatchdog() {
+        guard statusHoverWatchTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.08, repeats: true) { [weak self] _ in
+            self?.pollStatusHover()
+        }
+        // Include event-tracking mode so menu-bar interaction cannot pause the fallback.
+        RunLoop.main.add(timer, forMode: .common)
+        statusHoverWatchTimer = timer
+    }
+
+    private func pollStatusHover() {
+        let hoveringStatus = mode.showsTray && isMouseOverStatusItem()
+        let shouldShow = statusHoverDwell.update(
+            isHovering: hoveringStatus && !view.expanded && !hoverPanelActive,
+            now: ProcessInfo.processInfo.systemUptime)
+        if shouldShow {
+            hoverShowWorkItem?.cancel()
+            hoverShowWorkItem = nil
+            showHoverPanel()
+        }
+
+        guard hoverPanelActive else { return }
+        if isMouseInsideHoverRegions() {
+            hoverHideWorkItem?.cancel()
+            hoverHideWorkItem = nil
+        } else if hoverHideWorkItem == nil {
+            scheduleHoverPanelDismissal()
+        }
+    }
 
     private func installStatusHoverTracking() {
         guard let button = statusItem?.button else { return }
@@ -3050,6 +3105,15 @@ if argv.contains("--stats-test") {
     scroll.reset()
     precondition(scroll.consume(deltaY: 23, precise: true) == 0) // no stale fractional delta after reset
 
+    var hoverDwell = StatusHoverDwellState()
+    precondition(!hoverDwell.update(isHovering: true, now: 0))
+    precondition(!hoverDwell.update(isHovering: true, now: 0.119))
+    precondition(hoverDwell.update(isHovering: true, now: 0.12))
+    precondition(!hoverDwell.update(isHovering: true, now: 1.0)) // a new dwell begins after showing
+    precondition(!hoverDwell.update(isHovering: false, now: 1.05)) // leaving cancels the dwell
+    precondition(!hoverDwell.update(isHovering: true, now: 1.1))
+    precondition(hoverDwell.update(isHovering: true, now: 1.23))
+
     acc.reset(at: start.addingTimeInterval(60))
     precondition(acc.snapshot().rxBytes == 0 && acc.snapshot().processes.isEmpty)
     precondition(Fmt.bytes(1_536) == "1.5 KB")
@@ -3110,7 +3174,7 @@ if argv.contains("--stats-test") {
                                               point: NSPoint(x: 60, y: 180), userData: nil)
     precondition(statisticsTooltip == "完整路径：\n/Users/me/Project/server.js")
 
-    print("统计/身份自检通过：同进程身份聚合、不同应用/脚本路径分组、Electron 包路径识别、Node 入口提取、uv 可执行路径、命令行参数隐去、路径提示、滚动反向恢复、累计与排序/重置")
+    print("统计/身份自检通过：同进程身份聚合、不同应用/脚本路径分组、Electron 包路径识别、Node 入口提取、uv 可执行路径、命令行参数隐去、路径提示、滚动反向恢复、菜单栏悬停驻留、累计与排序/重置")
     exit(0)
 }
 
