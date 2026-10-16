@@ -107,8 +107,8 @@ private func footprintBytes(_ pid: pid_t) -> UInt64 {
     rusageV6(pid)?.ri_phys_footprint ?? 0
 }
 
-/// 把 nettop 的通用 runtime 名称映射成可辨认的应用/项目身份。
-/// 只显示应用包名或脚本/工作目录路径；完整命令行只在内存里解析，绝不展示其余参数。
+/// 把 nettop 的通用 runtime 名称映射成可辨认的应用/项目身份，并为 uv 显示可执行文件路径。
+/// 只显示应用包名或脚本/工作目录/可执行文件路径；完整命令行只在内存里解析，绝不展示其余参数。
 private final class ProcessIdentityResolver {
     struct Identity {
         let name: String
@@ -125,6 +125,7 @@ private final class ProcessIdentityResolver {
         let missing = processes.filter { cache[$0.pid]?.sourceName != $0.name }
         let electronProcesses = missing.filter { Self.isElectron($0.name) }
         let nodeProcesses = missing.filter { Self.isNode($0.name) }
+        let uvProcesses = missing.filter { Self.isUV($0.name) }
 
         for process in electronProcesses {
             let executable = Self.executablePath(pid: process.pid)
@@ -138,6 +139,11 @@ private final class ProcessIdentityResolver {
                 ?? process.name
             let fullPath = bundlePath ?? executable
             cache[process.pid] = (process.name, Identity(name: name, fullPath: fullPath))
+        }
+
+        for process in uvProcesses {
+            let executable = Self.executablePath(pid: process.pid)
+            cache[process.pid] = (process.name, Identity(name: process.name, fullPath: executable))
         }
 
         if !nodeProcesses.isEmpty {
@@ -175,6 +181,10 @@ private final class ProcessIdentityResolver {
 
     static func isNode(_ name: String) -> Bool {
         ["node", "nodejs"].contains(name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }
+
+    static func isUV(_ name: String) -> Bool {
+        name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "uv"
     }
 
     static func outermostAppBundlePath(from executablePath: String) -> String? {
@@ -330,6 +340,26 @@ final class Sampler {
                 column = newColumn
                 ascending = false
             }
+        }
+    }
+
+    /// Convert wheel/trackpad deltas to whole process-row steps; ignore zero and sub-row jitter.
+    struct StatisticsScrollAccumulator {
+        private var preciseRemainder: CGFloat = 0
+        private static let preciseStep: CGFloat = 46
+
+        mutating func consume(deltaY: CGFloat, precise: Bool) -> Int {
+            guard deltaY.isFinite, abs(deltaY) > 0.001 else { return 0 }
+            guard precise else { return deltaY > 0 ? -1 : 1 }
+            preciseRemainder += deltaY
+            let steps = Int(preciseRemainder / Self.preciseStep)
+            guard steps != 0 else { return 0 }
+            preciseRemainder -= CGFloat(steps) * Self.preciseStep
+            return -steps
+        }
+
+        mutating func reset() {
+            preciseRemainder = 0
         }
     }
 
@@ -1012,6 +1042,7 @@ final class BallView: NSView {
     var showPeriodStatistics = false
     var periodStatistics = Sampler.PeriodStatistics(since: Date(), rxBytes: 0, txBytes: 0, processes: [])
     var statisticsScrollOffset = 0
+    var statisticsScrollAccumulator = Sampler.StatisticsScrollAccumulator()
     private var statisticsSort = Sampler.StatisticsSortState()
     var selfCPU = 0.0
     var selfMemMB = 0.0
@@ -1441,6 +1472,12 @@ final class BallView: NSView {
         let processHeading: String
         if showPeriodStatistics {
             let total = periodStatistics.processes.count
+            let maxOffset = max(0, total - 5)
+            let clampedOffset = min(statisticsScrollOffset, maxOffset)
+            if clampedOffset != statisticsScrollOffset {
+                statisticsScrollOffset = clampedOffset
+                statisticsScrollAccumulator.reset()
+            }
             let start = total == 0 ? 0 : min(statisticsScrollOffset + 1, total)
             let end = min(statisticsScrollOffset + 5, total)
             processHeading = total > 5 ? "累计 \(start)-\(end)/\(total)" : "进程累计"
@@ -1460,8 +1497,6 @@ final class BallView: NSView {
              align: .right, boxWidth: 68)
 
         if showPeriodStatistics {
-            let count = periodStatistics.processes.count
-            statisticsScrollOffset = min(statisticsScrollOffset, max(0, count - 5))
             let sorted = periodStatistics.sortedProcesses(
                 byUpload: statisticsSort.column == .upload, ascending: statisticsSort.ascending)
             let top = Array(sorted.dropFirst(statisticsScrollOffset).prefix(5))
@@ -1503,6 +1538,7 @@ final class BallView: NSView {
     private func toggleStatisticsSort(_ column: Sampler.StatisticsSortState.Column) {
         statisticsSort.click(column)
         statisticsScrollOffset = 0
+        statisticsScrollAccumulator.reset()
         needsDisplay = true
     }
 
@@ -1842,13 +1878,25 @@ final class BallView: NSView {
         }
         let point = convert(event.locationInWindow, from: nil)
         guard point.y >= 172 && point.y < Metrics.panelH - 24 else {
+            statisticsScrollAccumulator.reset()
             super.scrollWheel(with: event)
             return
         }
         let maxOffset = max(0, periodStatistics.processes.count - 5)
-        guard maxOffset > 0 else { return }
-        let direction = event.scrollingDeltaY > 0 ? -1 : 1
-        statisticsScrollOffset = min(max(0, statisticsScrollOffset + direction), maxOffset)
+        guard maxOffset > 0 else {
+            statisticsScrollAccumulator.reset()
+            return
+        }
+        let offsetDelta = statisticsScrollAccumulator.consume(
+            deltaY: event.scrollingDeltaY, precise: event.hasPreciseScrollingDeltas)
+        guard offsetDelta != 0 else { return }
+        let nextOffset = min(max(0, statisticsScrollOffset + offsetDelta), maxOffset)
+        guard nextOffset != statisticsScrollOffset else {
+            statisticsScrollAccumulator.reset()
+            return
+        }
+        statisticsScrollOffset = nextOffset
+        if nextOffset == 0 || nextOffset == maxOffset { statisticsScrollAccumulator.reset() }
         needsDisplay = true
     }
 
@@ -2360,7 +2408,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func setPeriodStatisticsVisible(_ visible: Bool) {
         view.showPeriodStatistics = visible
-        if visible { view.statisticsScrollOffset = 0 }
+        if visible {
+            view.statisticsScrollOffset = 0
+            view.statisticsScrollAccumulator.reset()
+        }
         window?.invalidateCursorRects(for: view)
         view.needsDisplay = true
     }
@@ -2368,6 +2419,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func resetPeriodStatistics() {
         view.periodStatistics = sampler.resetPeriodStatistics()
         view.statisticsScrollOffset = 0
+        view.statisticsScrollAccumulator.reset()
         view.needsDisplay = true
     }
 
@@ -2986,6 +3038,18 @@ if argv.contains("--stats-test") {
     precondition(sort.column == .upload && sort.ascending)
     sort.click(.download)
     precondition(sort.column == .download && !sort.ascending)
+
+    var scroll = Sampler.StatisticsScrollAccumulator()
+    precondition(scroll.consume(deltaY: 0, precise: true) == 0) // zero-delta events must not move the list
+    precondition(scroll.consume(deltaY: -23, precise: true) == 0)
+    precondition(scroll.consume(deltaY: -23, precise: true) == 1) // one row down after 46pt
+    precondition(scroll.consume(deltaY: 23, precise: true) == 0)
+    precondition(scroll.consume(deltaY: 23, precise: true) == -1) // reverse gesture restores the top row
+    precondition(scroll.consume(deltaY: 0, precise: false) == 0)
+    precondition(scroll.consume(deltaY: -1, precise: false) == 1)
+    scroll.reset()
+    precondition(scroll.consume(deltaY: 23, precise: true) == 0) // no stale fractional delta after reset
+
     acc.reset(at: start.addingTimeInterval(60))
     precondition(acc.snapshot().rxBytes == 0 && acc.snapshot().processes.isEmpty)
     precondition(Fmt.bytes(1_536) == "1.5 KB")
@@ -3008,6 +3072,8 @@ if argv.contains("--stats-test") {
 
     precondition(ProcessIdentityResolver.isElectron("Electron Helper"))
     precondition(ProcessIdentityResolver.isNode("node"))
+    precondition(ProcessIdentityResolver.isUV("uv"))
+    precondition(!ProcessIdentityResolver.isUV("uvicorn"))
     precondition(ProcessIdentityResolver.outermostAppBundlePath(
         from: "/Applications/Editor.app/Contents/Frameworks/Helper.app/Contents/MacOS/Electron")
         == "/Applications/Editor.app")
@@ -3044,7 +3110,7 @@ if argv.contains("--stats-test") {
                                               point: NSPoint(x: 60, y: 180), userData: nil)
     precondition(statisticsTooltip == "完整路径：\n/Users/me/Project/server.js")
 
-    print("统计/身份自检通过：同进程身份聚合、不同应用/脚本路径分组、Electron 包路径识别、Node 入口提取、命令行参数隐去、实时/累计路径提示、累计与排序/重置")
+    print("统计/身份自检通过：同进程身份聚合、不同应用/脚本路径分组、Electron 包路径识别、Node 入口提取、uv 可执行路径、命令行参数隐去、路径提示、滚动反向恢复、累计与排序/重置")
     exit(0)
 }
 
@@ -3211,6 +3277,8 @@ if let i = argv.firstIndex(of: "--snapshot"), i + 1 < argv.count {
                                           fullPath: NSHomeDirectory() + "/Developer/web-app"),
                     Sampler.ProcessTotal(name: "Visual Studio Code", rxBytes: 1_780_000_000, txBytes: 440_000_000, viaProxy: true,
                                           fullPath: "/Applications/Visual Studio Code.app"),
+                    Sampler.ProcessTotal(name: "uv", rxBytes: 1_250_000_000, txBytes: 120_000, viaProxy: false,
+                                          fullPath: NSHomeDirectory() + "/.local/bin/uv"),
                     Sampler.ProcessTotal(name: "Dropbox", rxBytes: 940_000_000, txBytes: 150_000_000, viaProxy: false),
                     Sampler.ProcessTotal(name: "Safari", rxBytes: 620_000_000, txBytes: 87_000_000, viaProxy: true),
                     Sampler.ProcessTotal(name: "Steam Helper", rxBytes: 340_000_000, txBytes: 92_000_000, viaProxy: false),
