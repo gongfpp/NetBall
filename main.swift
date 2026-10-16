@@ -132,11 +132,38 @@ final class Sampler {
         var totalBytes: UInt64 { rxBytes &+ txBytes }
     }
 
+    struct StatisticsSortState {
+        enum Column: Equatable { case download, upload }
+        private(set) var column: Column = .download
+        private(set) var ascending = false
+
+        mutating func click(_ newColumn: Column) {
+            if column == newColumn {
+                ascending.toggle()
+            } else {
+                column = newColumn
+                ascending = false
+            }
+        }
+    }
+
     struct PeriodStatistics {
         let since: Date
         let rxBytes: UInt64
         let txBytes: UInt64
         let processes: [ProcessTotal]
+
+        func sortedProcesses(byUpload: Bool, ascending: Bool = false) -> [ProcessTotal] {
+            processes.sorted { a, b in
+                let primaryA = byUpload ? a.txBytes : a.rxBytes
+                let primaryB = byUpload ? b.txBytes : b.rxBytes
+                if primaryA != primaryB { return ascending ? primaryA < primaryB : primaryA > primaryB }
+                let secondaryA = byUpload ? a.rxBytes : a.txBytes
+                let secondaryB = byUpload ? b.rxBytes : b.txBytes
+                if secondaryA != secondaryB { return secondaryA > secondaryB }
+                return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+            }
+        }
     }
 
     /// 累计器按进程名汇总：同名的多个 PID（如 Chrome Helper）归并为一行
@@ -779,6 +806,7 @@ final class BallView: NSView {
     var showPeriodStatistics = false
     var periodStatistics = Sampler.PeriodStatistics(since: Date(), rxBytes: 0, txBytes: 0, processes: [])
     var statisticsScrollOffset = 0
+    private var statisticsSort = Sampler.StatisticsSortState()
     var selfCPU = 0.0
     var selfMemMB = 0.0
     var nettopCPU = 0.0
@@ -1214,13 +1242,23 @@ final class BallView: NSView {
             processHeading = "进程排行"
         }
         text(processHeading, x: pad + 112, y: 154, font: fSmall, color: Palette.dim)
-        text("下载", x: pad + 150, y: 154, font: fSmall, color: Palette.dim, align: .right, boxWidth: 62)
-        text("上传", x: pad + 212, y: 154, font: fSmall, color: Palette.dim, align: .right, boxWidth: 68)
+        let downloadTitle = showPeriodStatistics && statisticsSort.column == .download
+            ? "下载 \(statisticsSort.ascending ? "↑" : "↓")" : "下载"
+        let uploadTitle = showPeriodStatistics && statisticsSort.column == .upload
+            ? "上传 \(statisticsSort.ascending ? "↑" : "↓")" : "上传"
+        text(downloadTitle, x: pad + 150, y: 154, font: fSmall,
+             color: showPeriodStatistics && statisticsSort.column == .download ? Palette.cyan : Palette.dim,
+             align: .right, boxWidth: 62)
+        text(uploadTitle, x: pad + 212, y: 154, font: fSmall,
+             color: showPeriodStatistics && statisticsSort.column == .upload ? Palette.amber : Palette.dim,
+             align: .right, boxWidth: 68)
 
         if showPeriodStatistics {
             let count = periodStatistics.processes.count
             statisticsScrollOffset = min(statisticsScrollOffset, max(0, count - 5))
-            let top = Array(periodStatistics.processes.dropFirst(statisticsScrollOffset).prefix(5))
+            let sorted = periodStatistics.sortedProcesses(
+                byUpload: statisticsSort.column == .upload, ascending: statisticsSort.ascending)
+            let top = Array(sorted.dropFirst(statisticsScrollOffset).prefix(5))
             if top.isEmpty {
                 text("这段期间还没有流量", x: pad, y: 202, font: fRow, color: Palette.dim)
             } else {
@@ -1250,8 +1288,16 @@ final class BallView: NSView {
 
     private var liveTabRect: NSRect { NSRect(x: Metrics.pad, y: 151, width: 50, height: 22) }
     private var statisticsTabRect: NSRect { NSRect(x: Metrics.pad + 54, y: 151, width: 50, height: 22) }
+    private var downloadSortRect: NSRect { NSRect(x: Metrics.pad + 150, y: 151, width: 62, height: 22) }
+    private var uploadSortRect: NSRect { NSRect(x: Metrics.pad + 212, y: 151, width: 68, height: 22) }
     private var resetStatisticsRect: NSRect {
         NSRect(x: Metrics.panelW - Metrics.pad - 56, y: 78, width: 56, height: 22)
+    }
+
+    private func toggleStatisticsSort(_ column: Sampler.StatisticsSortState.Column) {
+        statisticsSort.click(column)
+        statisticsScrollOffset = 0
+        needsDisplay = true
     }
 
     private func drawPanelTab(_ title: String, rect: NSRect, selected: Bool, font: NSFont) {
@@ -1496,12 +1542,32 @@ final class BallView: NSView {
                 controller?.setPeriodStatisticsVisible(true)
                 return
             }
+            if showPeriodStatistics && downloadSortRect.contains(point) {
+                toggleStatisticsSort(.download)
+                return
+            }
+            if showPeriodStatistics && uploadSortRect.contains(point) {
+                toggleStatisticsSort(.upload)
+                return
+            }
             if showPeriodStatistics && resetStatisticsRect.contains(point) {
                 controller?.resetPeriodStatistics()
                 return
             }
         }
         controller?.toggleExpanded()
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard expanded else { return }
+        addCursorRect(liveTabRect, cursor: .pointingHand)
+        addCursorRect(statisticsTabRect, cursor: .pointingHand)
+        if showPeriodStatistics {
+            addCursorRect(resetStatisticsRect, cursor: .pointingHand)
+            addCursorRect(downloadSortRect, cursor: .pointingHand)
+            addCursorRect(uploadSortRect, cursor: .pointingHand)
+        }
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -2030,6 +2096,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func setPeriodStatisticsVisible(_ visible: Bool) {
         view.showPeriodStatistics = visible
         if visible { view.statisticsScrollOffset = 0 }
+        window?.invalidateCursorRects(for: view)
         view.needsDisplay = true
     }
 
@@ -2643,10 +2710,21 @@ if argv.contains("--stats-test") {
     precondition(sample.processes[0].name == "Safari")
     precondition(sample.processes[1].rxBytes == 3_072 && sample.processes[1].txBytes == 768)
     precondition(sample.processes[1].viaProxy)
+    precondition(sample.sortedProcesses(byUpload: false).first?.name == "Safari") // 默认按下载量降序
+    precondition(sample.sortedProcesses(byUpload: true).first?.name == "curl")  // 上传列点击后改按上传量降序
+    precondition(sample.sortedProcesses(byUpload: false, ascending: true).first?.name == "curl")
+    var sort = Sampler.StatisticsSortState()
+    precondition(sort.column == .download && !sort.ascending)
+    sort.click(.upload)
+    precondition(sort.column == .upload && !sort.ascending)
+    sort.click(.upload)
+    precondition(sort.column == .upload && sort.ascending)
+    sort.click(.download)
+    precondition(sort.column == .download && !sort.ascending)
     acc.reset(at: start.addingTimeInterval(60))
     precondition(acc.snapshot().rxBytes == 0 && acc.snapshot().processes.isEmpty)
     precondition(Fmt.bytes(1_536) == "1.5 KB")
-    print("统计自检通过：同名进程合并、上下行分别累计、按总流量排序、重置清零、单位格式正确")
+    print("统计自检通过：同名进程合并、上下行分别累计、下载/上传排序与升降序切换、重置清零、单位格式正确")
     exit(0)
 }
 
@@ -2812,7 +2890,7 @@ if let i = argv.firstIndex(of: "--snapshot"), i + 1 < argv.count {
                     Sampler.ProcessTotal(name: "Dropbox", rxBytes: 940_000_000, txBytes: 150_000_000, viaProxy: false),
                     Sampler.ProcessTotal(name: "Safari", rxBytes: 620_000_000, txBytes: 87_000_000, viaProxy: true),
                     Sampler.ProcessTotal(name: "Steam Helper", rxBytes: 340_000_000, txBytes: 92_000_000, viaProxy: false),
-                    Sampler.ProcessTotal(name: "Tailscale", rxBytes: 120_000_000, txBytes: 34_000_000, viaProxy: false),
+                    Sampler.ProcessTotal(name: "Tailscale", rxBytes: 120_000_000, txBytes: 3_400_000_000, viaProxy: false),
                 ]
                 v.periodStatistics = Sampler.PeriodStatistics(
                     since: Date().addingTimeInterval(-3 * 3600 - 27 * 60),
