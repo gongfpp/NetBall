@@ -702,6 +702,17 @@ final class ProxyProbe {
 
     // MARK: 对外
 
+    /// Mihomo 的 /connections 同时包含 DIRECT 流量。只有存在明确的非直连出口链时才标记；
+    /// 缺少链路信息，或路由为 DIRECT/拒绝类出口时，不显示「代理」。
+    static func hasProxiedOutbound(chains: [String]?) -> Bool {
+        guard let chains else { return false }
+        let names = chains.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
+                          .filter { !$0.isEmpty }
+        guard !names.isEmpty else { return false }
+        let nonProxyOutbounds: Set<String> = ["DIRECT", "REJECT", "REJECT-DROP", "BLOCK", "PASS"]
+        return !names.contains(where: nonProxyOutbounds.contains)
+    }
+
     /// 剔除代理核心 + 打标；返回 (过滤后的行, 是否命中过代理)
     func apply(to rows: [Sampler.Row]) -> [Sampler.Row] {
         guard !corePIDs.isEmpty || !proxiedPIDs.isEmpty else { return rows }
@@ -749,9 +760,10 @@ final class ProxyProbe {
 
         var hit: Set<Int> = []
         for c in conns {
+            // /connections 也会列出被 TUN 捕获但按规则直连的连接；不能仅凭出现于连接表就贴代理标签。
+            guard Self.hasProxiedOutbound(chains: c["chains"] as? [String]) else { continue }
             let m = c["metadata"] as? [String: Any] ?? [:]
-            // 优先用 mihomo 自己填的进程名（find-process-mode: always 时才有），
-            // 但拿不到 PID，所以主要还是靠 sourcePort 反查
+            // Mihomo 的 sourcePort 没有 PID，所以仍需通过 lsof 映射回本机进程。
             if let port = m["sourcePort"] as? String, let pid = portToPID[port] {
                 hit.insert(pid)
             }
@@ -3105,6 +3117,14 @@ if argv.contains("--stats-test") {
     scroll.reset()
     precondition(scroll.consume(deltaY: 23, precise: true) == 0) // no stale fractional delta after reset
 
+    precondition(ProxyProbe.hasProxiedOutbound(chains: ["🇯🇵日本高速08|BGP|CTCU", "良心云"]))
+    precondition(!ProxyProbe.hasProxiedOutbound(chains: ["DIRECT"]))
+    precondition(!ProxyProbe.hasProxiedOutbound(chains: [" direct "]))
+    precondition(!ProxyProbe.hasProxiedOutbound(chains: ["REJECT"]))
+    precondition(!ProxyProbe.hasProxiedOutbound(chains: ["DIRECT", "良心云"]))
+    precondition(!ProxyProbe.hasProxiedOutbound(chains: []))
+    precondition(!ProxyProbe.hasProxiedOutbound(chains: nil))
+
     var hoverDwell = StatusHoverDwellState()
     precondition(!hoverDwell.update(isHovering: true, now: 0))
     precondition(!hoverDwell.update(isHovering: true, now: 0.119))
@@ -3174,7 +3194,7 @@ if argv.contains("--stats-test") {
                                               point: NSPoint(x: 60, y: 180), userData: nil)
     precondition(statisticsTooltip == "完整路径：\n/Users/me/Project/server.js")
 
-    print("统计/身份自检通过：同进程身份聚合、不同应用/脚本路径分组、Electron 包路径识别、Node 入口提取、uv 可执行路径、命令行参数隐去、路径提示、滚动反向恢复、菜单栏悬停驻留、累计与排序/重置")
+    print("统计/身份自检通过：同进程身份聚合、不同应用/脚本路径分组、Electron 包路径识别、Node 入口提取、uv 可执行路径、代理 DIRECT/未知路由过滤、命令行参数隐去、路径提示、滚动反向恢复、菜单栏悬停驻留、累计与排序/重置")
     exit(0)
 }
 

@@ -113,14 +113,16 @@ open NetBall.app    # 启动，默认使用菜单栏模式
 （虚高幅度随代理流量占比变化，实测 1%~64%。）
 
 **在这两组样本中，过滤代理核心后总量接近对应的 curl 测量值；这不保证其他代理配置也能完全校正。**
-直连下载 6,160,348 字节（走 TUN）时，nettop 给 curl 记 6,216,458；混合端口下载 9,000,000 字节时，nettop 记 9,034,418。进一步打标时，程序会从 mihomo 连接表读取 `sourcePort`，再用 `lsof` 尝试映射到进程。
+直连下载 6,160,348 字节（走 TUN）时，nettop 给 curl 记 6,216,458；混合端口下载 9,000,000 字节时，nettop 记 9,034,418。进一步打标时，程序会从 mihomo 连接表读取路由链和 `sourcePort`，再用 `lsof` 尝试映射到进程。
 
 ```
 Google Chrome (代理)   1.4 MB/s    168 B/s
-UURemote    (代理)    28.9 KB/s    1.6 KB/s
+UURemote               28.9 KB/s    1.6 KB/s
 io.tailscale.ip        642 B/s     1.1 KB/s
 QQ          (代理)     531 B/s       0 B/s
 ```
+
+旧版只按 `sourcePort` 匹配时，可能把经 TUN 捕获但规则为 `DIRECT` 的连接误标；上例中的 UURemote 标记已移除。当前「代理」表示该进程至少有一条被识别为非直连的活动连接，不代表它的全部流量都经代理。
 
 #### 识别范围与边界
 
@@ -129,7 +131,7 @@ QQ          (代理)     531 B/s       0 B/s
 - 控制器只尝试固定位置：`/var/run/clash-verge-service/users/<uid>/verge-mihomo.sock`、`/tmp/clash-verge-service/users/<uid>/verge-mihomo.sock`、`${HOME}/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/verge-mihomo.sock`，以及裸 mihomo 常用的 `http://127.0.0.1:9090`。不会扫描任意端口或读取用户自定义端点。
 - 端点探测和 `/configs`、`/connections` 请求通过 `curl` 发出，**没有附带 API secret、token 或 Authorization 请求头**。需要鉴权、使用其他端点或找不到这些固定路径时，连接识别可能不可用。
 - 找不到控制器时，核心过滤会回退到固定进程名清单：`verge-mihomo`、`mihomo`、`clash-meta`、`clash-meta-alpha`、`sing-box`、`xray`、`v2ray`、`hysteria`、`tuic`。**清单中没有 Surge**；这不是对这些代理客户端或所有部署形态的完整支持声明。
-- 控制器可访问时，会从 `/connections` 读取 `sourcePort`，再通过 `lsof` 尝试映射到本机 PID 并加「代理」标记；权限、进程可见性或端口映射失败都可能导致漏标。
+- 控制器可访问时，会从 `/connections` 读取路由链与 `sourcePort`，再通过 `lsof` 尝试映射到本机 PID。仅路由链明确非直连时加「代理」标记；`DIRECT`、拒绝类出口或缺少链路信息均不标记。一个进程只要存在至少一条已观察到的非直连连接，就会显示标记；权限、进程可见性或端口映射失败仍可能导致漏标。
 
 因此，如果控制器未被固定端点探测到、代理核心名不在清单中，或连接无法映射，NetBall **不能保证**排除核心流量、标记代理进程或修正总速率；在这些配置下仍可能看到核心进程流量或重复计数。Clash Verge root 服务模式下，普通用户的 `lsof` / `ps` 可能看不到核心进程，程序会尝试用 `pgrep` 名称回退。
 
