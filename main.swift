@@ -1623,8 +1623,8 @@ final class BallView: NSView {
             Palette.cyan.withAlphaComponent(0.65).setStroke()
             badgePath.lineWidth = 1
             badgePath.stroke()
-            text("代理", x: badge.minX + 4, y: badge.minY + 2, font: NSFont.systemFont(ofSize: 9, weight: .semibold),
-                 color: Palette.cyan)
+            centeredText("代理", in: badge, font: NSFont.systemFont(ofSize: 9, weight: .semibold),
+                         color: Palette.cyan)
         }
         if let fullPath = p.fullPath {
             drawIdentityPath(fullPath, x: nameX, y: rowRect.minY + 20, maxWidth: labelRoom)
@@ -1717,7 +1717,7 @@ final class BallView: NSView {
             Palette.cyan.withAlphaComponent(0.7).setStroke()
             path.lineWidth = 1
             path.stroke()
-            text("代理", x: br.minX + 5.5, y: br.minY + 1, font: fBadge, color: Palette.cyan)
+            centeredText("代理", in: br, font: fBadge, color: Palette.cyan)
         }
         if let fullPath = r.fullPath {
             drawIdentityPath(fullPath, x: nameX, y: rowRect.minY + 20, maxWidth: labelRoom)
@@ -1756,6 +1756,12 @@ final class BallView: NSView {
         }
         str.draw(at: NSPoint(x: px, y: y))
         return size.width
+    }
+
+    private func centeredText(_ s: String, in rect: NSRect, font: NSFont, color: NSColor) {
+        let size = NSAttributedString(string: s, attributes: [.font: font]).size()
+        text(s, x: rect.minX, y: rect.minY + (rect.height - size.height) / 2,
+             font: font, color: color, align: .center, boxWidth: rect.width)
     }
 
     private func drawIdentityPath(_ path: String, x: CGFloat, y: CGFloat, maxWidth: CGFloat) {
