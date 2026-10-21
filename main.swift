@@ -305,6 +305,58 @@ private final class ProcessIdentityResolver {
 // （见 tools/nettop-cost.swift）。单次快照 `nettop -l 1` 只要 ~0.018s CPU / ~0.14s wall，
 // 所以这里改成"按间隔跑一次单发快照 + 与上一次做差分"，开销降到 ~1~2%。
 
+/// 从 macOS 接口计数器读取物理网络设备流量。只统计 enN，避免把 lo0 回环、utun VPN
+/// 隧道和 bridge/awdl 等虚拟接口再次算入外网总额。进程明细仍由 nettop 提供。
+private struct ExternalInterfaceSnapshot {
+    struct Counters {
+        var rx: UInt64 = 0
+        var tx: UInt64 = 0
+
+        mutating func add(rx: UInt64, tx: UInt64) {
+            self.rx &+= rx
+            self.tx &+= tx
+        }
+    }
+
+    let byInterface: [String: Counters]
+    var interfaceNames: [String] { byInterface.keys.sorted() }
+
+    func delta(since previous: ExternalInterfaceSnapshot) -> Counters {
+        var result = Counters()
+        for (name, current) in byInterface {
+            guard let old = previous.byInterface[name] else { continue }
+            result.add(rx: current.rx >= old.rx ? current.rx - old.rx : 0,
+                       tx: current.tx >= old.tx ? current.tx - old.tx : 0)
+        }
+        return result
+    }
+
+    static func isExternalInterfaceName(_ name: String) -> Bool {
+        guard name.hasPrefix("en"), name.count > 2 else { return false }
+        return name.dropFirst(2).allSatisfy { $0 >= "0" && $0 <= "9" }
+    }
+
+    static func read() -> ExternalInterfaceSnapshot? {
+        var first: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&first) == 0, let first else { return nil }
+        defer { freeifaddrs(first) }
+
+        var byInterface: [String: Counters] = [:]
+        var current: UnsafeMutablePointer<ifaddrs>? = first
+        while let entry = current?.pointee {
+            current = entry.ifa_next
+            guard let address = entry.ifa_addr,
+                  address.pointee.sa_family == sa_family_t(AF_LINK),
+                  let rawData = entry.ifa_data else { continue }
+            let name = String(cString: entry.ifa_name)
+            guard isExternalInterfaceName(name), (entry.ifa_flags & UInt32(IFF_UP)) != 0 else { continue }
+            let data = rawData.assumingMemoryBound(to: if_data.self).pointee
+            byInterface[name] = Counters(rx: UInt64(data.ifi_ibytes), tx: UInt64(data.ifi_obytes))
+        }
+        return ExternalInterfaceSnapshot(byInterface: byInterface)
+    }
+}
+
 final class Sampler {
     struct Row {
         let name: String
@@ -365,8 +417,10 @@ final class Sampler {
 
     struct PeriodStatistics {
         let since: Date
+        /// 系统物理网络接口的累计字节数；进程明细是另一套口径，包含本机回环。
         let rxBytes: UInt64
         let txBytes: UInt64
+        let externalInterfaces: [String]
         let processes: [ProcessTotal]
 
         func sortedProcesses(byUpload: Bool, ascending: Bool = false) -> [ProcessTotal] {
@@ -384,16 +438,22 @@ final class Sampler {
         }
     }
 
-    /// 累计器按应用/项目身份汇总；同一 Electron 包或 Node 入口的多个 PID 仍归并一行。
+    /// 外网总量取物理网卡计数；进程明细仍按应用/项目身份汇总（含回环）。
+    /// 同一 Electron 包或 Node 入口的多个 PID 在明细里仍归并一行。
     struct PeriodAccumulator {
         private(set) var since = Date()
         private(set) var rxBytes: UInt64 = 0
         private(set) var txBytes: UInt64 = 0
+        private(set) var externalInterfaces: [String] = []
         private var byIdentity: [String: ProcessTotal] = [:]
 
-        mutating func add(name: String, rx: UInt64, tx: UInt64, viaProxy: Bool, fullPath: String? = nil) {
+        mutating func addExternal(rx: UInt64, tx: UInt64, interfaces: [String]) {
             rxBytes &+= rx
             txBytes &+= tx
+            externalInterfaces = interfaces
+        }
+
+        mutating func add(name: String, rx: UInt64, tx: UInt64, viaProxy: Bool, fullPath: String? = nil) {
             let identity = ProcessTotal(name: name, rxBytes: 0, txBytes: 0, viaProxy: false, fullPath: fullPath)
             var p = byIdentity[identity.identityKey] ?? identity
             p.rxBytes &+= rx
@@ -406,6 +466,7 @@ final class Sampler {
             since = date
             rxBytes = 0
             txBytes = 0
+            externalInterfaces = []
             byIdentity.removeAll(keepingCapacity: true)
         }
 
@@ -416,7 +477,8 @@ final class Sampler {
                 if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
                 return ($0.fullPath ?? "").localizedCaseInsensitiveCompare($1.fullPath ?? "") == .orderedAscending
             }
-            return PeriodStatistics(since: since, rxBytes: rxBytes, txBytes: txBytes, processes: rows)
+            return PeriodStatistics(since: since, rxBytes: rxBytes, txBytes: txBytes,
+                                    externalInterfaces: externalInterfaces, processes: rows)
         }
     }
 
@@ -436,6 +498,7 @@ final class Sampler {
     private let queue = DispatchQueue(label: "netball.poll", qos: .utility)
     private var timer: DispatchSourceTimer?
     private var prev: [String: (UInt64, UInt64)] = [:]
+    private var previousExternalSnapshot: ExternalInterfaceSnapshot?
     private var lastTick = Date()
     private var inFlight = false
     private var periodAccumulator = PeriodAccumulator()
@@ -452,6 +515,7 @@ final class Sampler {
         queue.sync {
             periodAccumulator.reset()
             prev.removeAll(keepingCapacity: true)
+            previousExternalSnapshot = ExternalInterfaceSnapshot.read()
             lastTick = Date()
             return periodAccumulator.snapshot()
         }
@@ -542,59 +606,64 @@ final class Sampler {
             return Int(key[key.index(after: dot)...])
         })
         processIdentityResolver.retain(only: livePIDs)
-        guard !cur.isEmpty else { return }
 
         let now = Date()
-        guard !prev.isEmpty else {          // 第一次只做基线
-            prev = cur
-            lastTick = now
-            return
-        }
         let dt = max(0.2, now.timeIntervalSince(lastTick))
         lastTick = now
 
+        // 全局速率/累计量用物理网卡计数器，和本机回环、代理进程明细分开。
+        let externalNow = ExternalInterfaceSnapshot.read()
+        var externalDelta = ExternalInterfaceSnapshot.Counters()
+        if let externalNow, let previousExternalSnapshot {
+            externalDelta = externalNow.delta(since: previousExternalSnapshot)
+        }
+        previousExternalSnapshot = externalNow
+        periodAccumulator.addExternal(rx: externalDelta.rx, tx: externalDelta.tx,
+                                      interfaces: externalNow?.interfaceNames ?? [])
+        let totRx = Double(externalDelta.rx) / dt
+        let totTx = Double(externalDelta.tx) / dt
+
         var rows: [Row] = []
-        var totRx = 0.0
-        var totTx = 0.0
         var rawRx = 0.0
         var rawTx = 0.0
 
-        // 代理穿透：先决定哪些是代理核心，再统计 —— 核心承载的是别人的流量，
-        // 回环那一段还被重复记过，算进总量会让球/菜单栏的数字虚高 2~3 倍。
-        proxy.refreshCoreIfNeeded()
-        if active { proxy.refreshProxiedIfNeeded() }
-        let core = proxy.corePIDs
-        let proxied = proxy.proxiedPIDs
-        var traffic: [(name: String, pid: Int, rx: UInt64, tx: UInt64, viaProxy: Bool)] = []
+        // 进程明细仍来自 nettop，包含 loopback；代理核心本身仍从进程明细中剔除。
+        // 第一次采样只建立 nettop 基线，但外网网卡速率/累计仍照常更新。
+        if !prev.isEmpty {
+            proxy.refreshCoreIfNeeded()
+            if active { proxy.refreshProxiedIfNeeded() }
+            let core = proxy.corePIDs
+            let proxied = proxy.proxiedPIDs
+            var traffic: [(name: String, pid: Int, rx: UInt64, tx: UInt64, viaProxy: Bool)] = []
 
-        for (key, v) in cur {
-            guard let p = prev[key] else { continue }   // 新进程不上报第一秒的跳变
-            let dRxBytes = v.0 >= p.0 ? v.0 - p.0 : 0
-            let dTxBytes = v.1 >= p.1 ? v.1 - p.1 : 0
-            guard dRxBytes > 0 || dTxBytes > 0 else { continue }
-            guard let dot = key.lastIndex(of: "."), let pid = Int(key[key.index(after: dot)...]) else { continue }
-            let name = String(key[..<dot])
-            let dRx = Double(dRxBytes)
-            let dTx = Double(dTxBytes)
-            rawRx += dRx / dt                        // 不剔除的原始总量（自检对照用）
-            rawTx += dTx / dt
-            guard keepProxyCore || !core.contains(pid) else { continue }
-            totRx += dRx / dt
-            totTx += dTx / dt
-            traffic.append((name, pid, dRxBytes, dTxBytes, proxied.contains(pid)))
+            for (key, v) in cur {
+                guard let p = prev[key] else { continue }   // 新进程不上报首样本的跳变
+                let dRxBytes = v.0 >= p.0 ? v.0 - p.0 : 0
+                let dTxBytes = v.1 >= p.1 ? v.1 - p.1 : 0
+                guard dRxBytes > 0 || dTxBytes > 0 else { continue }
+                guard let dot = key.lastIndex(of: "."), let pid = Int(key[key.index(after: dot)...]) else { continue }
+                let name = String(key[..<dot])
+                let dRx = Double(dRxBytes)
+                let dTx = Double(dTxBytes)
+                rawRx += dRx / dt                        // 不剔除的原始进程总量（自检对照用）
+                rawTx += dTx / dt
+                guard keepProxyCore || !core.contains(pid) else { continue }
+                traffic.append((name, pid, dRxBytes, dTxBytes, proxied.contains(pid)))
+            }
+
+            let identities = processIdentityResolver.resolve(traffic.map { (name: $0.name, pid: $0.pid) })
+            for item in traffic {
+                let identity = identities[item.pid]
+                    ?? ProcessIdentityResolver.Identity(name: item.name, fullPath: nil)
+                periodAccumulator.add(name: identity.name, rx: item.rx, tx: item.tx,
+                                      viaProxy: item.viaProxy, fullPath: identity.fullPath)
+                rows.append(Row(name: identity.name, pid: item.pid,
+                                rx: Double(item.rx) / dt, tx: Double(item.tx) / dt,
+                                fullPath: identity.fullPath, viaProxy: item.viaProxy))
+            }
         }
 
-        let identities = processIdentityResolver.resolve(traffic.map { (name: $0.name, pid: $0.pid) })
-        for item in traffic {
-            let identity = identities[item.pid]
-                ?? ProcessIdentityResolver.Identity(name: item.name, fullPath: nil)
-            periodAccumulator.add(name: identity.name, rx: item.rx, tx: item.tx,
-                                  viaProxy: item.viaProxy, fullPath: identity.fullPath)
-            rows.append(Row(name: identity.name, pid: item.pid,
-                            rx: Double(item.rx) / dt, tx: Double(item.tx) / dt,
-                            fullPath: identity.fullPath, viaProxy: item.viaProxy))
-        }
-        let counted = traffic.count
+        let counted = rows.count
         lastRawTotals = (rawRx, rawTx)
         prev = cur
         rows.sort { $0.total > $1.total }
@@ -1052,7 +1121,8 @@ final class BallView: NSView {
     var procCount = 0
     var history: [(rx: Double, tx: Double)] = []
     var showPeriodStatistics = false
-    var periodStatistics = Sampler.PeriodStatistics(since: Date(), rxBytes: 0, txBytes: 0, processes: [])
+    var periodStatistics = Sampler.PeriodStatistics(since: Date(), rxBytes: 0, txBytes: 0,
+                                                    externalInterfaces: [], processes: [])
     var statisticsScrollOffset = 0
     var statisticsScrollAccumulator = Sampler.StatisticsScrollAccumulator()
     private var statisticsSort = Sampler.StatisticsSortState()
@@ -1462,8 +1532,8 @@ final class BallView: NSView {
         let fVal = NSFont.monospacedDigitSystemFont(ofSize: 12.5, weight: .semibold)
         let fFoot = NSFont.systemFont(ofSize: 10, weight: .regular)
 
-        text("实时流量", x: pad, y: 15, font: fTitle, color: Palette.text)
-        text(paused ? "已暂停" : "\(procCount) 个进程",
+        text("外网流量", x: pad, y: 15, font: fTitle, color: Palette.text)
+        text(paused ? "已暂停 · 进程明细含本机回环" : "进程明细含本机回环",
              x: pad, y: 15, font: fSmall, color: Palette.dim, align: .right, boxWidth: w - 2 * pad)
 
         text("↓ " + Fmt.rate(totalRx), x: pad, y: 42, font: fRate, color: Palette.cyan)
@@ -1571,7 +1641,9 @@ final class BallView: NSView {
     }
 
     private func drawPeriodSummary(x: CGFloat, width: CGFloat, small: NSFont, rate: NSFont, foot: NSFont) {
-        text("累计总流量 · 自启动/重置起", x: x, y: 80, font: small, color: Palette.dim)
+        let interfaces = periodStatistics.externalInterfaces
+        let interfaceLabel = interfaces.isEmpty ? "物理网卡不可用" : interfaces.joined(separator: "+")
+        text("外网累计（\(interfaceLabel)）· 自启动/重置起", x: x, y: 80, font: small, color: Palette.dim)
         let resetPath = NSBezierPath(roundedRect: resetStatisticsRect, xRadius: 7, yRadius: 7)
         NSColor(white: 1, alpha: 0.07).setFill()
         resetPath.fill()
@@ -2984,7 +3056,8 @@ private final class LiveBox {
     private var tx = 0.0
     private var count = 0
     private var hist: [(rx: Double, tx: Double)] = []
-    private var period = Sampler.PeriodStatistics(since: Date(), rxBytes: 0, txBytes: 0, processes: [])
+    private var period = Sampler.PeriodStatistics(since: Date(), rxBytes: 0, txBytes: 0,
+                                                  externalInterfaces: [], processes: [])
     /// 不剔除代理核心的原始总量（代理穿透自检做对照用）
     private var raw: (rx: Double, tx: Double) = (0, 0)
 
@@ -3088,14 +3161,37 @@ if argv.contains("--ease-test") {
 }
 
 if argv.contains("--stats-test") {
+    precondition(ExternalInterfaceSnapshot.isExternalInterfaceName("en0"))
+    precondition(ExternalInterfaceSnapshot.isExternalInterfaceName("en12"))
+    precondition(!ExternalInterfaceSnapshot.isExternalInterfaceName("lo0"))
+    precondition(!ExternalInterfaceSnapshot.isExternalInterfaceName("utun4"))
+    precondition(!ExternalInterfaceSnapshot.isExternalInterfaceName("bridge0"))
+    precondition(!ExternalInterfaceSnapshot.isExternalInterfaceName("en0x"))
+    let oldInterfaces = ExternalInterfaceSnapshot(byInterface: [
+        "en0": .init(rx: 100, tx: 200),
+        "en1": .init(rx: 50, tx: 70),
+        "lo0": .init(rx: 10_000, tx: 10_000),
+    ])
+    let newInterfaces = ExternalInterfaceSnapshot(byInterface: [
+        "en0": .init(rx: 130, tx: 260),
+        "en1": .init(rx: 55, tx: 80),
+        "en2": .init(rx: 900, tx: 900), // new interface contributes only after its next baseline
+    ])
+    let interfaceDelta = newInterfaces.delta(since: oldInterfaces)
+    precondition(interfaceDelta.rx == 35 && interfaceDelta.tx == 70)
+
     var acc = Sampler.PeriodAccumulator()
     let start = Date(timeIntervalSince1970: 1_800_000_000)
     acc.reset(at: start)
+    acc.addExternal(rx: 10_000, tx: 20_000, interfaces: ["en0"])
     acc.add(name: "curl", rx: 2_048, tx: 512, viaProxy: true)
     acc.add(name: "curl", rx: 1_024, tx: 256, viaProxy: false)
     acc.add(name: "Safari", rx: 4_096, tx: 128, viaProxy: false)
     let sample = acc.snapshot()
-    precondition(sample.rxBytes == 7_168 && sample.txBytes == 896)
+    precondition(sample.rxBytes == 10_000 && sample.txBytes == 20_000) // interface total is independent of process rows
+    precondition(sample.externalInterfaces == ["en0"])
+    precondition(sample.processes.reduce(UInt64(0)) { $0 &+ $1.rxBytes } == 7_168)
+    precondition(sample.processes.reduce(UInt64(0)) { $0 &+ $1.txBytes } == 896)
     precondition(sample.processes.count == 2)
     precondition(sample.processes[0].name == "Safari")
     precondition(sample.processes[1].rxBytes == 3_072 && sample.processes[1].txBytes == 768)
@@ -3193,14 +3289,14 @@ if argv.contains("--stats-test") {
     precondition(liveTooltip == "完整路径：\n/Users/me/Project/server.js")
     tooltipView.showPeriodStatistics = true
     tooltipView.periodStatistics = Sampler.PeriodStatistics(
-        since: Date(), rxBytes: 10, txBytes: 0,
+        since: Date(), rxBytes: 10, txBytes: 0, externalInterfaces: ["en0"],
         processes: [Sampler.ProcessTotal(name: "node · server.js", rxBytes: 10, txBytes: 0,
                                          viaProxy: false, fullPath: "/Users/me/Project/server.js")])
     let statisticsTooltip = tooltipView.view(tooltipView, stringForToolTip: 0,
                                               point: NSPoint(x: 60, y: 180), userData: nil)
     precondition(statisticsTooltip == "完整路径：\n/Users/me/Project/server.js")
 
-    print("统计/身份自检通过：同进程身份聚合、不同应用/脚本路径分组、Electron 包路径识别、Node 入口提取、uv 可执行路径、代理 DIRECT/未知路由过滤、命令行参数隐去、路径提示、滚动反向恢复、菜单栏悬停驻留、累计与排序/重置")
+    print("统计/身份自检通过：en 网卡过滤与差分、总量独立于进程明细、loopback/utun 排除、同进程身份聚合、应用/脚本路径分组、Electron 包路径识别、Node 入口提取、uv 路径、代理路由过滤、命令行参数隐去、路径提示、滚动与累计排序/重置")
     exit(0)
 }
 
@@ -3259,9 +3355,8 @@ if argv.contains("--draw-cost") {
 }
 
 if argv.contains("--proxy-test") {
-    // 代理穿透自检：开一次真实采样（面板展开档），同一份数据里同时给出
-    // "不剔除代理核心"和"剔除后"两个总量，不用开 GUI 也能验证虚高修掉了多少。
-    // 取整段里流量最大的那一次采样 —— 下载这类短时流量只出现在中间某几拍。
+    // 代理穿透自检：采集一段真实数据，展示外网接口总量，以及进程明细剔除代理核心前后差异。
+    // 取整段里进程流量最大的那一拍 —— 下载这类短时流量只出现在中间某几拍。
     _ = NSApplication.shared
     let secs = doubleArg("--proxy-test", 8)
     let box = LiveBox()
@@ -3284,16 +3379,22 @@ if argv.contains("--proxy-test") {
     s.stop()
 
     print("控制器端点: \(s.proxy.endpointDesc ?? "没找到 —— 不做穿透，保持原样")")
-    print("代理核心 PID: \(s.proxy.corePIDs.sorted())  （从排行和总量里剔除）")
+    print("代理核心 PID: \(s.proxy.corePIDs.sorted())  （只从进程明细中剔除）")
     print("走代理的 PID: \(s.proxy.proxiedPIDs.sorted())")
     print(String(format: "\n峰值那一刻："))
-    print(String(format: "  不剔除（nettop 原样）  ↓%-12@ ↑%-12@",
+    print(String(format: "  外网接口总量           ↓%-12@ ↑%-12@",
+                 Fmt.rate(best.rx) as NSString, Fmt.rate(best.tx) as NSString))
+    print(String(format: "  nettop 进程合计(未剔除) ↓%-12@ ↑%-12@",
                  Fmt.rate(best.raw.rx) as NSString, Fmt.rate(best.raw.tx) as NSString))
-    print(String(format: "  剔除后（实际显示）      ↓%-12@ ↑%-12@   进程数 %d",
-                 Fmt.rate(best.rx) as NSString, Fmt.rate(best.tx) as NSString, best.count))
-    let rt = best.raw.rx + best.raw.tx, ft = best.rx + best.tx
-    if rt > 0 {
-        print(String(format: "  → 原来虚高了 %.0f%%（同一个字节被代理核心重复记的那部分）", (1 - ft / rt) * 100))
+    let filteredRx = best.rows.reduce(0.0) { $0 + $1.rx }
+    let filteredTx = best.rows.reduce(0.0) { $0 + $1.tx }
+    print(String(format: "  进程明细(剔除核心后)   ↓%-12@ ↑%-12@   进程数 %d",
+                 Fmt.rate(filteredRx) as NSString, Fmt.rate(filteredTx) as NSString, best.count))
+    let rawProcessTotal = best.raw.rx + best.raw.tx
+    let filteredProcessTotal = filteredRx + filteredTx
+    if rawProcessTotal > 0 {
+        print(String(format: "  → 代理核心占进程明细原始量 %.0f%%（不影响上方外网总量）",
+                     (1 - filteredProcessTotal / rawProcessTotal) * 100))
     }
     print("\n排行（剔除后）:")
     for r in best.rows.prefix(8) {
@@ -3376,9 +3477,10 @@ if let i = argv.firstIndex(of: "--snapshot"), i + 1 < argv.count {
                 ]
                 v.periodStatistics = Sampler.PeriodStatistics(
                     since: Date().addingTimeInterval(-3 * 3600 - 27 * 60),
-                    rxBytes: processes.reduce(0) { $0 &+ $1.rxBytes },
-                    txBytes: processes.reduce(0) { $0 &+ $1.txBytes },
-                    processes: processes
+                    // Synthetic physical-interface totals intentionally differ from nettop process rows.
+                    rxBytes: 11_200_000_000,
+                    txBytes: 2_100_000_000,
+                    externalInterfaces: ["en0"], processes: processes
                 )
             }
         }
