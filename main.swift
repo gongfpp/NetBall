@@ -107,6 +107,14 @@ private func footprintBytes(_ pid: pid_t) -> UInt64 {
     rusageV6(pid)?.ri_phys_footprint ?? 0
 }
 
+/// PID 必须连同进程创建时间一起使用，避免退出后复用 PID 把流量归给旧应用。
+private func processIncarnation(_ pid: Int) -> String? {
+    var info = proc_bsdinfo()
+    let size = MemoryLayout<proc_bsdinfo>.size
+    guard proc_pidinfo(pid_t(pid), PROC_PIDTBSDINFO, 0, &info, Int32(size)) == size else { return nil }
+    return "\(pid):\(info.pbi_start_tvsec):\(info.pbi_start_tvusec)"
+}
+
 /// 把 nettop 的通用 runtime 名称映射成可辨认的应用/项目身份，并为 uv 显示可执行文件路径。
 /// 只显示应用包名或脚本/工作目录/可执行文件路径；完整命令行只在内存里解析，绝不展示其余参数。
 private final class ProcessIdentityResolver {
@@ -115,14 +123,23 @@ private final class ProcessIdentityResolver {
         let fullPath: String?
     }
 
-    private var cache: [Int: (sourceName: String, identity: Identity)] = [:]
+    private var cache: [Int: (sourceName: String, incarnation: String?, identity: Identity)] = [:]
 
     func retain(only pids: Set<Int>) {
-        cache = cache.filter { pids.contains($0.key) }
+        // 暂时没有 socket 不等于进程退出；复用身份前仍校验 PID 创建时间。
+        // 保留少量离线身份，避免 Node 间歇联网反复触发 ps/目录查询。
+        if cache.count > 512 { cache = cache.filter { pids.contains($0.key) } }
     }
 
     func resolve(_ processes: [(name: String, pid: Int)]) -> [Int: Identity] {
-        let missing = processes.filter { cache[$0.pid]?.sourceName != $0.name }
+        let lifetimes: [Int: String] = Dictionary(uniqueKeysWithValues: processes.compactMap { process in
+            guard let lifetime = processIncarnation(process.pid) else { return nil }
+            return (process.pid, lifetime)
+        })
+        let missing = processes.filter {
+            cache[$0.pid]?.sourceName != $0.name || lifetimes[$0.pid] == nil
+                || cache[$0.pid]?.incarnation != lifetimes[$0.pid]
+        }
         let electronProcesses = missing.filter { Self.isElectron($0.name) }
         let nodeProcesses = missing.filter { Self.isNode($0.name) }
         let uvProcesses = missing.filter { Self.isUV($0.name) }
@@ -138,12 +155,12 @@ private final class ProcessIdentityResolver {
                 ?? bundlePath.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent }
                 ?? process.name
             let fullPath = bundlePath ?? executable
-            cache[process.pid] = (process.name, Identity(name: name, fullPath: fullPath))
+            cache[process.pid] = (process.name, lifetimes[process.pid], Identity(name: name, fullPath: fullPath))
         }
 
         for process in uvProcesses {
             let executable = Self.executablePath(pid: process.pid)
-            cache[process.pid] = (process.name, Identity(name: process.name, fullPath: executable))
+            cache[process.pid] = (process.name, lifetimes[process.pid], Identity(name: process.name, fullPath: executable))
         }
 
         if !nodeProcesses.isEmpty {
@@ -165,12 +182,24 @@ private final class ProcessIdentityResolver {
                 } else {
                     label = process.name
                 }
-                cache[process.pid] = (process.name, Identity(name: label, fullPath: location))
+                cache[process.pid] = (process.name, lifetimes[process.pid], Identity(name: label, fullPath: location))
             }
         }
 
+        for process in missing where !Self.isElectron(process.name) && !Self.isNode(process.name) && !Self.isUV(process.name) {
+            let executable = Self.executablePath(pid: process.pid)
+            let bundlePath = executable.flatMap(Self.outermostAppBundlePath(from:))
+            let bundle = bundlePath.flatMap { Bundle(path: $0) }
+            let label = bundle?.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+                ?? bundle?.object(forInfoDictionaryKey: "CFBundleName") as? String
+                ?? process.name
+            cache[process.pid] = (process.name, lifetimes[process.pid],
+                                  Identity(name: label, fullPath: bundlePath ?? executable))
+        }
+
         return Dictionary(uniqueKeysWithValues: processes.compactMap { process in
-            guard let entry = cache[process.pid], entry.sourceName == process.name else { return nil }
+            guard let entry = cache[process.pid], entry.sourceName == process.name,
+                  entry.incarnation == lifetimes[process.pid] else { return nil }
             return (process.pid, entry.identity)
         })
     }
@@ -283,17 +312,15 @@ private final class ProcessIdentityResolver {
     }
 
     private static func workingDirectories(pids: [Int]) -> [Int: String] {
-        guard !pids.isEmpty,
-              let output = runTool("/usr/sbin/lsof", ["-a", "-p", pids.map { String($0) }.joined(separator: ","), "-d", "cwd", "-Fn"]) else {
-            return [:]
-        }
         var result: [Int: String] = [:]
-        var currentPID: Int?
-        for line in output.split(separator: "\n") {
-            if line.first == "p" { currentPID = Int(line.dropFirst()) }
-            else if line.first == "n", let currentPID {
-                result[currentPID] = String(line.dropFirst())
+        for pid in pids {
+            var info = proc_vnodepathinfo()
+            let size = MemoryLayout<proc_vnodepathinfo>.size
+            guard proc_pidinfo(pid_t(pid), PROC_PIDVNODEPATHINFO, 0, &info, Int32(size)) == size else { continue }
+            let path = withUnsafePointer(to: &info.pvi_cdir.vip_path) { pointer in
+                pointer.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
             }
+            if !path.isEmpty { result[pid] = path }
         }
         return result
     }
@@ -306,7 +333,7 @@ private final class ProcessIdentityResolver {
 // 所以这里改成"按间隔跑一次单发快照 + 与上一次做差分"，开销降到 ~1~2%。
 
 /// 从 macOS 接口计数器读取物理网络设备流量。只统计 enN，避免把 lo0 回环、utun VPN
-/// 隧道和 bridge/awdl 等虚拟接口再次算入外网总额。进程明细仍由 nettop 提供。
+/// 隧道和 bridge/awdl 等虚拟接口再次算入总额。应用明细另由连接账本归属，不能反推物理总量。
 private struct ExternalInterfaceSnapshot {
     struct Counters {
         var rx: UInt64 = 0
@@ -358,6 +385,10 @@ private struct ExternalInterfaceSnapshot {
 }
 
 final class Sampler {
+    // 需要连接元组来做代理归属；读取回环仅用于匹配，绝不把回环原始字节加入明细。
+    // 参数顺序和 -c 都经过实测：避免 nettop 在首次快照前忙等；保留累计字节，不用 -d。
+    static let nettopArguments = ["-x", "-n", "-L", "1", "-J", "interface,state,bytes_in,bytes_out", "-c"]
+
     struct Row {
         let name: String
         let pid: Int
@@ -417,11 +448,12 @@ final class Sampler {
 
     struct PeriodStatistics {
         let since: Date
-        /// 系统物理网络接口的累计字节数；进程明细是另一套口径，包含本机回环。
+        /// 系统物理网络接口累计字节；应用明细为代理 payload + 去重后的直连 socket 字节。
         let rxBytes: UInt64
         let txBytes: UInt64
         let externalInterfaces: [String]
         let processes: [ProcessTotal]
+        var attributionStatus: String = "归属待采样"
 
         func sortedProcesses(byUpload: Bool, ascending: Bool = false) -> [ProcessTotal] {
             processes.sorted { a, b in
@@ -438,14 +470,17 @@ final class Sampler {
         }
     }
 
-    /// 外网总量取物理网卡计数；进程明细仍按应用/项目身份汇总（含回环）。
-    /// 同一 Electron 包或 Node 入口的多个 PID 在明细里仍归并一行。
+    /// 总量取物理网卡计数；明细仅累加连接账本产出的去重增量。
+    /// 同一应用或 Node 入口的多个 PID 在明细里归并一行。
     struct PeriodAccumulator {
         private(set) var since = Date()
         private(set) var rxBytes: UInt64 = 0
         private(set) var txBytes: UInt64 = 0
         private(set) var externalInterfaces: [String] = []
         private var byIdentity: [String: ProcessTotal] = [:]
+        private var attributionStatus = "归属待采样"
+
+        mutating func setAttributionStatus(_ status: String) { attributionStatus = status }
 
         mutating func addExternal(rx: UInt64, tx: UInt64, interfaces: [String]) {
             rxBytes &+= rx
@@ -467,6 +502,7 @@ final class Sampler {
             rxBytes = 0
             txBytes = 0
             externalInterfaces = []
+            attributionStatus = "归属待采样"
             byIdentity.removeAll(keepingCapacity: true)
         }
 
@@ -478,7 +514,8 @@ final class Sampler {
                 return ($0.fullPath ?? "").localizedCaseInsensitiveCompare($1.fullPath ?? "") == .orderedAscending
             }
             return PeriodStatistics(since: since, rxBytes: rxBytes, txBytes: txBytes,
-                                    externalInterfaces: externalInterfaces, processes: rows)
+                                    externalInterfaces: externalInterfaces, processes: rows,
+                                    attributionStatus: attributionStatus)
         }
     }
 
@@ -496,8 +533,21 @@ final class Sampler {
     var activeInterval: Double = 1.0
 
     private let queue = DispatchQueue(label: "netball.poll", qos: .utility)
+    private let detailQueue = DispatchQueue(label: "netball.connections", qos: .utility)
     private var timer: DispatchSourceTimer?
-    private var prev: [String: (UInt64, UInt64)] = [:]
+    private var running = false
+    private var needsResumeBaseline = false
+    private var detailBudget = SamplingBudget()
+    private var detailProvider: (() -> DetailSample)? // 仅自检注入阻塞扫描，生产默认为 nil。
+    private var detailGeneration = 0
+    private var detailRows: [Row] = []
+    private var detailRawTotals = (rx: 0.0, tx: 0.0)
+    private var detailCoreTotals = (rx: 0.0, tx: 0.0)
+    private var physicalRates = (rx: 0.0, tx: 0.0)
+    private(set) var detailInterval = SamplingBudget.minimumInterval
+    private(set) var detailScans = 0
+    private var rawBaselines: [String: (rx: UInt64, tx: UInt64, at: Date)] = [:]
+    private var attribution = AttributionLedger()
     private var previousExternalSnapshot: ExternalInterfaceSnapshot?
     private var lastTick = Date()
     private var inFlight = false
@@ -513,36 +563,72 @@ final class Sampler {
     @discardableResult
     func resetPeriodStatistics() -> PeriodStatistics {
         queue.sync {
-            periodAccumulator.reset()
-            prev.removeAll(keepingCapacity: true)
+            let now = Date()
+            detailGeneration += 1
+            periodAccumulator.reset(at: now)
+            detailRows = []
+            detailBudget.requestRefresh()
+            // 队列顺序保证旧扫描先结束、再清基线；旧结果用 generation 丢弃。
+            // 不在主线程等待昂贵扫描，重置立即生效。
+            detailQueue.async { [self] in
+                attribution.reset(at: now)
+                rawBaselines.removeAll(keepingCapacity: true)
+            }
             previousExternalSnapshot = ExternalInterfaceSnapshot.read()
-            lastTick = Date()
+            lastTick = now
             return periodAccumulator.snapshot()
         }
     }
 
-    /// 代理穿透（剔除代理核心 + 给走代理的行打标）
-    let proxy = ProxyProbe()
-    /// 自检用：临时关掉代理核心剔除，做 A/B 对照
-    var keepProxyCore = false
-    /// 最近一次采样里"不剔除代理核心"的原始总量（同一份数据，可直接对比）
+    /// 每个明细周期都读取代理计数；与面板是否展开无关。
+    let proxy = ProxyTrafficProbe()
+    /// 原始物理 socket 速率，仅自检用；含核心 wire bytes，绝不加回应用明细。
     private(set) var lastRawTotals: (rx: Double, tx: Double) = (0, 0)
+    private(set) var lastCoreTotals: (rx: Double, tx: Double) = (0, 0)
 
     // 子进程开销统计（nettop 是一次性的短命进程）
-    private var childCPUBase = 0.0
     private(set) var childCPUSeconds = 0.0
+    private(set) var deliveredChildCPUSeconds = 0.0
     private(set) var childPeakFootprint: UInt64 = 0
     private(set) var shots = 0
 
     func start() {
         paused = false
+        queue.sync {
+            if needsResumeBaseline {
+                let now = Date()
+                previousExternalSnapshot = ExternalInterfaceSnapshot.read()
+                lastTick = now
+                detailBudget.requestRefresh()
+                // 不把暂停期间的字节补进累计；旧扫描之后、下一轮扫描之前清基线。
+                detailQueue.async { [self] in
+                    attribution.reset(at: now)
+                    rawBaselines.removeAll(keepingCapacity: true)
+                }
+                needsResumeBaseline = false
+            }
+            running = true
+        }
         schedule(immediate: true)
     }
 
-    func stop() {
+    /// 用户暂停/退出不等昂贵扫描；仅基准和无界面自检明确要求排空队列。
+    func stop(waitForDetails: Bool = false) {
         paused = true
         timer?.cancel()
         timer = nil
+        queue.sync {
+            running = false
+            if !waitForDetails {
+                detailGeneration += 1
+                detailRows = []
+                needsResumeBaseline = true
+            }
+        }
+        guard waitForDetails else { return }
+        // 两条队列都排空：CPU 基准必须包含最后一轮扫描及其已回收子进程。
+        detailQueue.sync {}
+        queue.sync { publishSnapshot() }
     }
 
     func resume() { if paused { start() } }
@@ -586,103 +672,183 @@ final class Sampler {
     }
 
     private func poll() {
-        guard !inFlight else { return }
-        inFlight = true
-        defer { inFlight = false }
-
-        let cpuBefore = Self.reapedChildrenCPU()
-        guard let text = shot() else { return }
-        childCPUSeconds += max(0, Self.reapedChildrenCPU() - cpuBefore)
+        guard running else { return }
+        let now = Date()
+        let elapsed = max(0.2, now.timeIntervalSince(lastTick))
+        lastTick = now
+        let current = ExternalInterfaceSnapshot.read()
+        var delta = ExternalInterfaceSnapshot.Counters()
+        if let current, let previousExternalSnapshot { delta = current.delta(since: previousExternalSnapshot) }
+        previousExternalSnapshot = current
+        periodAccumulator.addExternal(rx: delta.rx, tx: delta.tx, interfaces: current?.interfaceNames ?? [])
+        physicalRates = (Double(delta.rx) / elapsed, Double(delta.tx) / elapsed)
         shots += 1
 
-        var cur: [String: (UInt64, UInt64)] = [:]
-        for line in text.split(separator: "\n") {
-            if line.contains("bytes_in") { continue }
-            guard let parsed = Sampler.parse(String(line)) else { continue }
-            cur[parsed.key] = (parsed.rx, parsed.tx)
-        }
-        let livePIDs = Set(cur.keys.compactMap { key -> Int? in
-            guard let dot = key.lastIndex(of: ".") else { return nil }
-            return Int(key[key.index(after: dot)...])
-        })
-        processIdentityResolver.retain(only: livePIDs)
-
-        let now = Date()
-        let dt = max(0.2, now.timeIntervalSince(lastTick))
-        lastTick = now
-
-        // 全局速率/累计量用物理网卡计数器，和本机回环、代理进程明细分开。
-        let externalNow = ExternalInterfaceSnapshot.read()
-        var externalDelta = ExternalInterfaceSnapshot.Counters()
-        if let externalNow, let previousExternalSnapshot {
-            externalDelta = externalNow.delta(since: previousExternalSnapshot)
-        }
-        previousExternalSnapshot = externalNow
-        periodAccumulator.addExternal(rx: externalDelta.rx, tx: externalDelta.tx,
-                                      interfaces: externalNow?.interfaceNames ?? [])
-        let totRx = Double(externalDelta.rx) / dt
-        let totTx = Double(externalDelta.tx) / dt
-
-        var rows: [Row] = []
-        var rawRx = 0.0
-        var rawTx = 0.0
-
-        // 进程明细仍来自 nettop，包含 loopback；代理核心本身仍从进程明细中剔除。
-        // 第一次采样只建立 nettop 基线，但外网网卡速率/累计仍照常更新。
-        if !prev.isEmpty {
-            proxy.refreshCoreIfNeeded()
-            if active { proxy.refreshProxiedIfNeeded() }
-            let core = proxy.corePIDs
-            let proxied = proxy.proxiedPIDs
-            var traffic: [(name: String, pid: Int, rx: UInt64, tx: UInt64, viaProxy: Bool)] = []
-
-            for (key, v) in cur {
-                guard let p = prev[key] else { continue }   // 新进程不上报首样本的跳变
-                let dRxBytes = v.0 >= p.0 ? v.0 - p.0 : 0
-                let dTxBytes = v.1 >= p.1 ? v.1 - p.1 : 0
-                guard dRxBytes > 0 || dTxBytes > 0 else { continue }
-                guard let dot = key.lastIndex(of: "."), let pid = Int(key[key.index(after: dot)...]) else { continue }
-                let name = String(key[..<dot])
-                let dRx = Double(dRxBytes)
-                let dTx = Double(dTxBytes)
-                rawRx += dRx / dt                        // 不剔除的原始进程总量（自检对照用）
-                rawTx += dTx / dt
-                guard keepProxyCore || !core.contains(pid) else { continue }
-                traffic.append((name, pid, dRxBytes, dTxBytes, proxied.contains(pid)))
-            }
-
-            let identities = processIdentityResolver.resolve(traffic.map { (name: $0.name, pid: $0.pid) })
-            for item in traffic {
-                let identity = identities[item.pid]
-                    ?? ProcessIdentityResolver.Identity(name: item.name, fullPath: nil)
-                periodAccumulator.add(name: identity.name, rx: item.rx, tx: item.tx,
-                                      viaProxy: item.viaProxy, fullPath: identity.fullPath)
-                rows.append(Row(name: identity.name, pid: item.pid,
-                                rx: Double(item.rx) / dt, tx: Double(item.tx) / dt,
-                                fullPath: identity.fullPath, viaProxy: item.viaProxy))
+        if !inFlight, detailBudget.isDue(at: now) {
+            inFlight = true
+            let generation = detailGeneration
+            detailQueue.async { [self] in
+                let sample = collectDetails()
+                queue.async { [self] in
+                    inFlight = false
+                    childCPUSeconds += sample.childrenCPU
+                    detailScans += 1
+                    guard generation == detailGeneration else { return }
+                    detailBudget.completed(cpuSeconds: sample.effort, started: sample.started, finished: sample.finished)
+                    detailRows = sample.rows
+                    detailRawTotals = sample.raw
+                    detailCoreTotals = sample.core
+                    periodAccumulator.setAttributionStatus(sample.status)
+                    for delta in sample.deltas {
+                        let owner = delta.owner
+                        periodAccumulator.add(name: owner == .unknown ? "未归属代理流量" : owner.name,
+                                              rx: delta.rx, tx: delta.tx, viaProxy: delta.viaProxy, fullPath: owner.path)
+                    }
+                }
             }
         }
+        publishSnapshot()
+    }
 
-        let counted = rows.count
-        lastRawTotals = (rawRx, rawTx)
-        prev = cur
-        rows.sort { $0.total > $1.total }
-
-        let r = rows, rx = totRx, tx = totTx, n = counted
+    /// 只在轻量状态队列组装 UI 快照；连接队列即使阻塞也不影响顶部网速。
+    private func publishSnapshot() {
+        let rows = detailRows, rates = physicalRates
+        let raw = detailRawTotals, core = detailCoreTotals
         let period = periodAccumulator.snapshot()
+        let childCPU = childCPUSeconds, detailInterval = detailBudget.interval
         deliverQueue.async { [weak self] in
             guard let self else { return }
-            // 和回调写在同一个队列上：自检里读它就一定是当前这一份，不会读到半新半旧
-            self.lastRawTotals = (rawRx, rawTx)
-            self.onSnapshot?(r, rx, tx, n, period)
+            self.deliveredChildCPUSeconds = childCPU
+            self.detailInterval = detailInterval
+            self.lastRawTotals = raw
+            self.lastCoreTotals = core
+            self.onSnapshot?(rows, rates.rx, rates.tx, rows.count, period)
         }
     }
 
-    /// 跑一次单发快照；`nettop -l 1` 是"打印一份就退出"
+    static func runSchedulingTests() {
+        let sampler = Sampler()
+        sampler.deliverQueue = DispatchQueue(label: "netball.scheduler-test.delivery")
+        let began = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        sampler.detailProvider = {
+            began.signal()
+            precondition(release.wait(timeout: .now() + 5) == .success)
+            let now = Date()
+            let delta = TrafficDelta(owner: .unknown, rx: 123, tx: 456, rxRate: 123, txRate: 456, viaProxy: true)
+            return DetailSample(rows: [], deltas: [delta], status: "stale-test", raw: (0, 0), core: (0, 0),
+                                childrenCPU: 0.1, effort: 0.1, started: now, finished: now)
+        }
+        sampler.queue.sync { sampler.running = true; sampler.poll() }
+        precondition(began.wait(timeout: .now() + 2) == .success)
+        // 昂贵扫描仍被阻塞时，网卡刷新和重置必须可以继续，且不能开启重叠扫描。
+        sampler.queue.sync { sampler.poll(); precondition(sampler.shots == 2 && sampler.inFlight) }
+        let reset = sampler.resetPeriodStatistics()
+        sampler.stop() // 必须在扫描还被阻塞时立即返回，不能卡住用户的暂停操作。
+        sampler.queue.sync { precondition(!sampler.running && sampler.inFlight) }
+        release.signal()
+        sampler.stop(waitForDetails: true)
+        sampler.deliverQueue.sync {}
+        let final = sampler.currentPeriodStatistics()
+        precondition(sampler.detailScans == 1 && abs(sampler.childCPUSeconds - 0.1) < 0.0001)
+        precondition(final.since == reset.since && final.processes.isEmpty && final.attributionStatus == "归属待采样")
+        print("SamplingSchedulingTests: passed (responsive physical/pause, no overlap, stale reset discarded)")
+    }
+
+    private struct DetailSample {
+        let rows: [Row]
+        let deltas: [TrafficDelta]
+        let status: String
+        let raw: (rx: Double, tx: Double)
+        let core: (rx: Double, tx: Double)
+        let childrenCPU: Double
+        let effort: Double
+        let started: Date
+        let finished: Date
+    }
+
+    /// nettop/身份/代理必须在同一轮中归属和去重，但不能阻塞物理网速刷新。
+    private func collectDetails() -> DetailSample {
+        if let detailProvider { return detailProvider() }
+        let started = Date()
+        let cpuBefore = Self.reapedChildrenCPU()
+        let ownBefore = cpuSeconds(getpid()) ?? 0
+        let text = shot()
+        let socketTime = Date()
+        var parsed = text.flatMap { text in
+            SocketTraffic.parseCSV(text) { pid, name in
+                let lifetime = processIncarnation(pid)
+                    ?? "\(pid):unverified:\(socketTime.timeIntervalSinceReferenceDate)"
+                return TrafficOwner(pid: pid, incarnation: lifetime, name: name)
+            }
+        }
+        if let sockets = parsed {
+            let names = Dictionary(sockets.compactMap { socket -> (Int, String)? in
+                guard let pid = socket.owner.pid else { return nil }
+                return (pid, socket.owner.name)
+            }, uniquingKeysWith: { first, _ in first })
+            processIdentityResolver.retain(only: Set(names.keys))
+            let identities = processIdentityResolver.resolve(names.map { (name: $0.value, pid: $0.key) })
+            parsed = sockets.map { socket in
+                let identity = socket.owner.pid.flatMap { identities[$0] }
+                let owner = TrafficOwner(pid: socket.owner.pid, incarnation: socket.owner.incarnation,
+                                         name: identity?.name ?? socket.owner.name, path: identity?.fullPath)
+                return SocketTraffic(key: socket.key, owner: owner, network: socket.network,
+                                     local: socket.local, remote: socket.remote, interface: socket.interface,
+                                     rx: socket.rx, tx: socket.tx)
+            }
+        }
+        let proxySnapshot = proxy.poll(sockets: parsed, at: socketTime)
+        let now = Date()
+        let deltas = attribution.sample(sockets: parsed, proxy: proxySnapshot,
+                                       corePIDs: proxy.corePIDs, at: now)
+        var status = proxy.status
+        if parsed == nil { status = "进程归属不可用" }
+        else if !attribution.diagnostics.isEmpty, proxySnapshot != nil {
+            status = "代理归属不完整"
+        }
+
+        // 实时/累计都按应用身份合并多个 PID；同一应用的代理连接和真正直连只各记一次。
+        var byIdentity: [String: Row] = [:]
+        for delta in deltas {
+            let owner = delta.owner
+            let name = owner == .unknown ? "未归属代理流量" : owner.name
+            let key = name + "\u{0}" + (owner.path ?? "")
+            let previous = byIdentity[key]
+            byIdentity[key] = Row(name: name, pid: previous?.pid ?? owner.pid ?? 0,
+                                  rx: (previous?.rx ?? 0) + delta.rxRate,
+                                  tx: (previous?.tx ?? 0) + delta.txRate,
+                                  fullPath: owner.path, viaProxy: (previous?.viaProxy ?? false) || delta.viaProxy)
+        }
+        let rows = byIdentity.values.sorted { $0.total > $1.total }
+
+        var rawRx = 0.0, rawTx = 0.0, coreRx = 0.0, coreTx = 0.0
+        if let sockets = parsed {
+            var current: [String: (rx: UInt64, tx: UInt64, at: Date)] = [:]
+            for socket in sockets where ExternalInterfaceSnapshot.isExternalInterfaceName(socket.interface)
+                && !socket.local.isLoopback && !socket.remote.isLoopback {
+                if let old = rawBaselines[socket.key] {
+                    let elapsed = max(0.2, now.timeIntervalSince(old.at))
+                    let rx = Double(socket.rx >= old.rx ? socket.rx - old.rx : 0) / elapsed
+                    let tx = Double(socket.tx >= old.tx ? socket.tx - old.tx : 0) / elapsed
+                    rawRx += rx; rawTx += tx
+                    if let pid = socket.owner.pid, proxy.corePIDs.contains(pid) { coreRx += rx; coreTx += tx }
+                }
+                current[socket.key] = (socket.rx, socket.tx, now)
+            }
+            rawBaselines = current
+        }
+        let childrenCPU = max(0, Self.reapedChildrenCPU() - cpuBefore)
+        let ownCPU = max(0, (cpuSeconds(getpid()) ?? ownBefore) - ownBefore)
+        return DetailSample(rows: rows, deltas: deltas, status: status,
+                            raw: (rawRx, rawTx), core: (coreRx, coreTx), childrenCPU: childrenCPU,
+                            effort: childrenCPU + ownCPU, started: started, finished: Date())
+    }
+
+    /// 跑一次单发快照；CSV 累计字节与现有连接账本相同，不运行常驻忙等进程。
     private func shot() -> String? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/nettop")
-        p.arguments = ["-P", "-x", "-n", "-l", "1", "-J", "bytes_in,bytes_out"]
+        p.arguments = Self.nettopArguments
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = Pipe()
@@ -696,9 +862,14 @@ final class Sampler {
             foot = footprintBytes(pid)
             if foot > 0 { break }
         }
+        // nettop 偶发首帧忙等；超时只终止本轮自建子进程，不能拖住主界面。
+        let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5, execute: watchdog)
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
+        watchdog.cancel()
         if foot > 0 { childPeakFootprint = max(childPeakFootprint, foot) }
+        guard p.terminationStatus == 0 else { return nil }
         return String(data: data, encoding: .utf8)
     }
 
@@ -710,14 +881,7 @@ final class Sampler {
              + Double(ru.ru_stime.tv_sec) + Double(ru.ru_stime.tv_usec) / 1e6
     }
 
-    /// "Name with spaces.1234                                123  456"
-    private static func parse(_ line: String) -> (key: String, rx: UInt64, tx: UInt64)? {
-        let parts = line.split(separator: " ", omittingEmptySubsequences: true)
-        guard parts.count >= 3,
-              let tx = UInt64(parts[parts.count - 1]),
-              let rx = UInt64(parts[parts.count - 2]) else { return nil }
-        return (parts[0..<(parts.count - 2)].joined(separator: " "), rx, tx)
-    }
+
 }
 
 // MARK: - 代理穿透（mihomo / Clash Verge）
@@ -735,201 +899,6 @@ private func runTool(_ path: String, _ args: [String]) -> String? {
     p.waitUntilExit()
     guard p.terminationStatus == 0 else { return nil }
     return String(data: data, encoding: .utf8)
-}
-
-/// 用了代理之后，nettop 里会出现一个虚高的代理核心，把真实应用全压下去。
-/// 两个原因叠加：① TUN 模式下出站 socket 属于代理核心；② 混合端口的回环那一段
-/// 应用和代理核心各持一端，nettop 两边都算 —— 同一个字节最多被记三次。
-///
-/// 但**归因本身是对的**：实测直连下载 6,160,348 字节（走 TUN），nettop 给 curl 记的是
-/// 6,216,458；走混合端口下载 9,000,000 字节，nettop 给 curl 记 9,034,418。
-/// 所以只要把代理核心从排行里剔掉，排行和总量就都恢复成真实值了，不需要"搬"流量。
-///
-/// 剩下的活是打标：问 mihomo 要连接表，把 sourcePort 用 lsof 映射回进程，
-/// 就知道哪些应用是走代理出去的，给它们标个「代理」。
-///
-/// 代价：lsof 一次约 0.02s CPU，所以只在**面板展开时**跑，而且节流到 5s 一次；
-/// 核心 PID 只在启动和每 60s 复核一次。
-final class ProxyProbe {
-    /// 代理核心进程 PID（从排行和总量里剔除）
-    private(set) var corePIDs: Set<Int> = []
-    /// 最近一次探测里"走了代理"的进程 PID（打标用）
-    private(set) var proxiedPIDs: Set<Int> = []
-    /// 命中过的控制器端点，nil = 这台机器上没有可识别的代理
-    private(set) var endpointDesc: String?
-    /// 面板没展开时也想知道总量是否被代理污染，所以核心探测与展开状态无关
-    private(set) var lastCoreScan = Date.distantPast
-    private var lastProxiedScan = Date.distantPast
-    private var lastSuccess = Date.distantPast
-
-    private var endpoint: (args: [String], base: String)?
-    private var lastDiscoverAttempt = Date.distantPast
-
-    /// 没找到控制器时的兜底：按进程名剔除已知的代理核心
-    private static let coreNameHints = ["verge-mihomo", "mihomo", "clash-meta", "clash-meta-alpha",
-                                        "sing-box", "xray", "v2ray", "hysteria", "tuic"]
-
-    // MARK: 对外
-
-    /// Mihomo 的 /connections 同时包含 DIRECT 流量。只有存在明确的非直连出口链时才标记；
-    /// 缺少链路信息，或路由为 DIRECT/拒绝类出口时，不显示「代理」。
-    static func hasProxiedOutbound(chains: [String]?) -> Bool {
-        guard let chains else { return false }
-        let names = chains.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
-                          .filter { !$0.isEmpty }
-        guard !names.isEmpty else { return false }
-        let nonProxyOutbounds: Set<String> = ["DIRECT", "REJECT", "REJECT-DROP", "BLOCK", "PASS"]
-        return !names.contains(where: nonProxyOutbounds.contains)
-    }
-
-    /// 剔除代理核心 + 打标；返回 (过滤后的行, 是否命中过代理)
-    func apply(to rows: [Sampler.Row]) -> [Sampler.Row] {
-        guard !corePIDs.isEmpty || !proxiedPIDs.isEmpty else { return rows }
-        return rows.compactMap { r in
-            if corePIDs.contains(r.pid) { return nil }
-            var m = r
-            m.viaProxy = proxiedPIDs.contains(r.pid)
-            return m
-        }
-    }
-
-    /// 核心 PID：启动时 + 每 60s 复核（一次 lsof，约 0.02s）
-    func refreshCoreIfNeeded(force: Bool = false) {
-        let now = Date()
-        guard force || now.timeIntervalSince(lastCoreScan) > 60 else { return }
-        lastCoreScan = now
-        if let found = scanCore() {
-            corePIDs = found
-            lastSuccess = now
-        } else if now.timeIntervalSince(lastSuccess) > 30 {
-            // 代理已经退出了：清掉，免得 PID 复用后误伤别的进程
-            corePIDs = []
-            proxiedPIDs = []
-        }
-    }
-
-    /// 走了代理的进程：只在面板展开时跑，节流 5s
-    func refreshProxiedIfNeeded(interval: TimeInterval = 5) {
-        let now = Date()
-        guard now.timeIntervalSince(lastProxiedScan) >= interval else { return }
-        lastProxiedScan = now
-        guard discoverEndpoint() != nil else { return }
-
-        // 一次 lsof 同时拿到 端口→PID（ESTABLISHED）和 监听端口→PID（LISTEN）
-        guard let lsof = runTool("/usr/sbin/lsof", ["-nP", "-iTCP"]) else { return }
-        var portToPID: [String: Int] = [:]
-        for line in lsof.split(separator: "\n") {
-            guard let e = Self.parseLsof(String(line)), !e.listening else { continue }
-            portToPID[e.port] = e.pid
-        }
-
-        guard let data = api("/connections"),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let conns = obj["connections"] as? [[String: Any]] else { return }
-
-        var hit: Set<Int> = []
-        for c in conns {
-            // /connections 也会列出被 TUN 捕获但按规则直连的连接；不能仅凭出现于连接表就贴代理标签。
-            guard Self.hasProxiedOutbound(chains: c["chains"] as? [String]) else { continue }
-            let m = c["metadata"] as? [String: Any] ?? [:]
-            // Mihomo 的 sourcePort 没有 PID，所以仍需通过 lsof 映射回本机进程。
-            if let port = m["sourcePort"] as? String, let pid = portToPID[port] {
-                hit.insert(pid)
-            }
-        }
-        proxiedPIDs = hit
-        lastSuccess = Date()
-    }
-
-    // MARK: 内部
-
-    /// 找到代理核心进程。
-    /// 名字这条路是主力：Clash Verge 用 root 服务模式跑 mihomo，普通用户既看不到它的
-    /// socket（lsof 无输出）、ps 也可能被限制，只有 pgrep 能稳定拿到 PID。
-    /// 监听端口那条路是补充：代理以当前用户身份跑时才有效，能兜住名字不在清单里的核心。
-    private func scanCore() -> Set<Int>? {
-        var pids = scanCoreByName() ?? []
-        if discoverEndpoint() != nil,
-           let data = api("/configs"),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            let ports = ["mixed-port", "port", "socks-port"]
-                .compactMap { obj[$0] as? Int }
-                .filter { $0 > 0 }
-            if !ports.isEmpty,
-               let lsof = runTool("/usr/sbin/lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"]) {
-                for line in lsof.split(separator: "\n") {
-                    guard let e = Self.parseLsof(String(line)), e.listening,
-                          ports.contains(Int(e.port) ?? -1) else { continue }
-                    pids.insert(e.pid)
-                }
-            }
-        }
-        return pids.isEmpty ? nil : pids
-    }
-
-    /// 按名字找代理核心（pgrep -x 匹配的是 comm 的 basename）
-    private func scanCoreByName() -> Set<Int>? {
-        var pids: Set<Int> = []
-        for name in Self.coreNameHints {
-            guard let out = runTool("/usr/bin/pgrep", ["-x", name]) else { continue }
-            for line in out.split(separator: "\n") {
-                if let pid = Int(line.trimmingCharacters(in: .whitespaces)) { pids.insert(pid) }
-            }
-        }
-        return pids.isEmpty ? nil : pids
-    }
-
-    /// 控制器端点：Clash Verge 服务模式是 unix socket，裸 mihomo 一般是 9090
-    @discardableResult
-    private func discoverEndpoint() -> (args: [String], base: String)? {
-        if let e = endpoint { return e }
-        // 没代理的机器上别每 5 秒白试一遍：失败也缓存 60 秒
-        guard Date().timeIntervalSince(lastDiscoverAttempt) > 60 else { return nil }
-        lastDiscoverAttempt = Date()
-        let uid = getuid()
-        var candidates: [(args: [String], base: String)] = [
-            (["--unix-socket", "/var/run/clash-verge-service/users/\(uid)/verge-mihomo.sock"],
-             "http://localhost"),
-            (["--unix-socket", "/tmp/clash-verge-service/users/\(uid)/verge-mihomo.sock"],
-             "http://localhost"),
-            ([], "http://127.0.0.1:9090"),
-        ]
-        if let home = ProcessInfo.processInfo.environment["HOME"] {
-            candidates.insert((["--unix-socket",
-                                "\(home)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/verge-mihomo.sock"],
-                               "http://localhost"), at: 2)
-        }
-        for c in candidates {
-            guard let out = runTool("/usr/bin/curl",
-                                     c.args + ["-s", "--max-time", "2", c.base + "/version"]),
-                  out.contains("version") else { continue }
-            endpoint = c
-            endpointDesc = c.args.isEmpty ? c.base : c.args.last!
-            return c
-        }
-        return nil
-    }
-
-    private func api(_ path: String) -> Data? {
-        guard let e = endpoint else { return nil }
-        guard let out = runTool("/usr/bin/curl",
-                                 e.args + ["-s", "--max-time", "3", e.base + path]) else { return nil }
-        return out.data(using: .utf8)
-    }
-
-    /// lsof -nP -iTCP 的一行 → (pid, 本地端口, 是不是 LISTEN)
-    /// 例：`verge-mih  1244 mass   22u  IPv4 ... TCP *:7897 (LISTEN)`
-    ///     `Google     45565 mass  45u  IPv4 ... TCP 127.0.0.1:58705->127.0.0.1:7897 (ESTABLISHED)`
-    static func parseLsof(_ line: String) -> (pid: Int, port: String, listening: Bool)? {
-        let f = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-        guard f.count >= 9, let pid = Int(f[1]) else { return nil }
-        guard let name = f.last(where: { $0.contains(":") && !$0.hasPrefix("(") }) else { return nil }
-        let local = name.contains("->") ? String(name[..<name.range(of: "->")!.lowerBound]) : name
-        guard let colon = local.lastIndex(of: ":") else { return nil }
-        let port = String(local[local.index(after: colon)...])
-        guard !port.isEmpty, port.allSatisfy(\.isNumber) else { return nil }
-        return (pid, port, line.contains("(LISTEN)"))
-    }
 }
 
 // MARK: - 配色
@@ -1150,6 +1119,7 @@ final class BallView: NSView {
     private(set) var peakTxLevel: CGFloat = 0
     var paused = false
     var intervalLabel = "1s"
+    var detailIntervalLabel = "2s"
     var snapshotBackdrop = false
     var snapshotWhite = false
 
@@ -1533,7 +1503,7 @@ final class BallView: NSView {
         let fFoot = NSFont.systemFont(ofSize: 10, weight: .regular)
 
         text("外网流量", x: pad, y: 15, font: fTitle, color: Palette.text)
-        text(paused ? "已暂停 · 进程明细含本机回环" : "进程明细含本机回环",
+        text(paused ? "已暂停" : periodStatistics.attributionStatus,
              x: pad, y: 15, font: fSmall, color: Palette.dim, align: .right, boxWidth: w - 2 * pad)
 
         text("↓ " + Fmt.rate(totalRx), x: pad, y: 42, font: fRate, color: Palette.cyan)
@@ -1562,9 +1532,9 @@ final class BallView: NSView {
             }
             let start = total == 0 ? 0 : min(statisticsScrollOffset + 1, total)
             let end = min(statisticsScrollOffset + 5, total)
-            processHeading = total > 5 ? "累计 \(start)-\(end)/\(total)" : "进程累计"
+            processHeading = total > 5 ? "应用 \(start)-\(end)/\(total)" : "应用累计"
         } else {
-            processHeading = "进程排行"
+            processHeading = "应用排行"
         }
         text(processHeading, x: pad + 112, y: 154, font: fSmall, color: Palette.dim)
         let downloadTitle = showPeriodStatistics && statisticsSort.column == .download
@@ -1604,8 +1574,8 @@ final class BallView: NSView {
             }
         }
 
-        let foot = "自身 \(Fmt.pct(selfCPU)) · \(String(format: "%.0f", selfMemMB)) MB"
-            + " · nettop \(Fmt.pct(nettopCPU)) · 采样 \(intervalLabel)"
+        let foot = "CPU均值 \(Fmt.pct(selfCPU + nettopCPU)) · \(String(format: "%.0f", selfMemMB)) MB"
+            + " · 网速\(intervalLabel)/明细目标\(detailIntervalLabel)"
         text(foot, x: pad, y: h - 22, font: fFoot, color: Palette.dim)
     }
 
@@ -1658,7 +1628,7 @@ final class BallView: NSView {
         text("↑ " + Fmt.bytes(periodStatistics.txBytes), x: x, y: 100,
              font: rate, color: Palette.amber, align: .right, boxWidth: width)
         let elapsed = Date().timeIntervalSince(periodStatistics.since)
-        text("统计时长 \(Fmt.duration(elapsed)) · \(periodStatistics.processes.count) 种进程",
+        text("统计时长 \(Fmt.duration(elapsed)) · \(periodStatistics.processes.count) 个应用身份",
              x: x, y: 128, font: foot, color: Palette.dim)
     }
 
@@ -1930,6 +1900,8 @@ final class BallView: NSView {
         guard expanded else { return }
         addToolTip(NSRect(x: Metrics.pad, y: 172, width: Metrics.panelW - 2 * Metrics.pad, height: 232),
                        owner: self, userData: nil)
+        addToolTip(NSRect(x: Metrics.pad, y: Metrics.panelH - 30, width: Metrics.panelW - 2 * Metrics.pad, height: 30),
+                   owner: self, userData: nil)
         addCursorRect(liveTabRect, cursor: .pointingHand)
         addCursorRect(statisticsTabRect, cursor: .pointingHand)
         if showPeriodStatistics {
@@ -1942,6 +1914,9 @@ final class BallView: NSView {
     @objc func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag,
                     point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
         guard view === self, expanded else { return "" }
+        if point.y >= Metrics.panelH - 30 {
+            return "最近约30秒 CPU均值（100%=一个核心）：自身 \(Fmt.pct(selfCPU)) + 采集工具 \(Fmt.pct(nettopCPU))。\n内存仅为主程序；不含子进程或 WindowServer。\n明细间隔是CPU预算目标；受网速档位、扫描用时与调度影响，实际可能更久。明细速率为扫描区间平均值。"
+        }
         let offset = point.y - 176
         guard offset >= 0 else { return "" }
         let index = Int(offset / 46)
@@ -2049,7 +2024,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var selfCPU = 0.0
     private var selfMem: UInt64 = 0
-    private var lastCPUSample: (time: Date, cpu: Double)?
+    private var cpuWindow = CPUUsageWindow()
     private var benchmarkSeconds: Double?
     private var benchmarkStart = Date()
     private var benchmarkUpdates = 0
@@ -2150,12 +2125,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.intervalLabel = "\(Int(sampler.idleInterval))s"
 
         sampler.onSnapshot = { [weak self] rows, rx, tx, count, period in
-            guard let self else { return }
+            // reset 的 queue.sync 不能撤回已经排入主队列的旧快照。
+            guard let self, period.since >= self.view.periodStatistics.since else { return }
             self.benchmarkUpdates += 1
             self.view.intervalLabel = "\(Int(self.sampler.interval))s"
-            self.view.nettopCPU = self.startDate.timeIntervalSinceNow < 0
-                ? self.sampler.childCPUSeconds / max(1, -self.startDate.timeIntervalSinceNow) * 100
-                : 0
+            self.view.detailIntervalLabel = String(format: "%.0fs", self.sampler.detailInterval)
             self.view.rows = rows
             self.view.periodStatistics = period
             // --anim-demo：用振荡的合成速率替掉真实速率，强制每次采样都触发 0.4s 缓动，
@@ -2175,6 +2149,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sampler.start()
 
         benchmarkSelfCPU0 = cpuSeconds(getpid()) ?? 0
+        _ = cpuWindow.record(at: Date(), own: benchmarkSelfCPU0, helpers: 0)
         statsTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refreshSelfStats()
         }
@@ -2215,7 +2190,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let el = Date().timeIntervalSince(self.startDate)
                 let vis = self.statusItem?.button?.window?.isVisible ?? false
                 print("t=\(Int(el))s  模式=\(self.mode.rawValue)  图标可见=\(vis)  标题=[\(self.lastTitleText)]")
-                if el >= secs { timer.invalidate(); self.sampler.stop(); exit(0) }
+                if el >= secs { timer.invalidate(); self.sampler.stop(waitForDetails: true); exit(0) }
             }
             t.tolerance = 0.2
         }
@@ -2479,24 +2454,23 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshSelfStats() {
         let now = Date()
         let cpu = cpuSeconds(getpid()) ?? 0
-        if let last = lastCPUSample {
-            let dt = max(0.5, now.timeIntervalSince(last.time))
-            selfCPU = (cpu - last.cpu) / dt * 100
-        }
-        lastCPUSample = (now, cpu)
+        let usage = cpuWindow.record(at: now, own: cpu, helpers: sampler.deliveredChildCPUSeconds)
+        selfCPU = usage.own
         selfMem = footprintBytes(getpid())
+        view.nettopCPU = usage.helpers
         view.selfCPU = selfCPU
         view.selfMemMB = Double(selfMem) / 1048576
         view.needsDisplay = true
     }
 
     private func finishBenchmark() {
+        sampler.stop(waitForDetails: true) // 先回收最后的子进程，再统计时间/CPU；不能漏掉在途扫描。
         let wall = Date().timeIntervalSince(benchmarkStart)
         let selfCPUAvg = ((cpuSeconds(getpid()) ?? 0) - benchmarkSelfCPU0) / wall * 100
         let nettopCPU = sampler.childCPUSeconds / wall * 100
-        var out = "benchmark 间隔=\(Int(sampler.interval))s  时长=\(String(format: "%.1f", wall))s  采样次数=\(sampler.shots)\n"
+        var out = "benchmark 网速=\(Int(sampler.interval))s 明细目标≈\(String(format: "%.1f", sampler.detailInterval))s 时长=\(String(format: "%.1f", wall))s 刷新=\(sampler.shots) 明细扫描=\(sampler.detailScans)\n"
         out += "  NetBall  自身  cpu均值=\(Fmt.pct(selfCPUAvg))  peakFootprint=\(Fmt.mb(benchmarkPeakSelf))\n"
-        out += "  nettop   子进程 cpu均值=\(Fmt.pct(nettopCPU))  peakFootprint=\(Fmt.mb(sampler.childPeakFootprint))\n"
+        out += "  采集工具 子进程 cpu均值=\(Fmt.pct(nettopCPU))  nettopPeak=\(Fmt.mb(sampler.childPeakFootprint))\n"
         out += "  合计     cpu≈\(Fmt.pct(selfCPUAvg + nettopCPU))\n"
         out += String(format: "  弧线缓动 定时器帧=%d  实际重绘=%d  重绘均值=%.1f 次/秒\n",
                       animFrames, view.drawCount, Double(view.drawCount) / wall)
@@ -2504,7 +2478,6 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         out += "  内存轨迹 \(marks.joined(separator: "  "))\n"
         out += "  末值 \(Fmt.mb(memTrace.last ?? 0))\n"
         print(out)
-        sampler.stop()
         exit(0)
     }
 
@@ -2648,7 +2621,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let freqItem = NSMenuItem(title: "空闲采样频率", action: nil, keyEquivalent: "")
         let sub = NSMenu()
         for v in [1.0, 2.0, 5.0] {
-            let it = NSMenuItem(title: "\(Int(v)) 秒（展开面板时固定 1 秒）", action: #selector(menuSetFreq(_:)), keyEquivalent: "")
+            let it = NSMenuItem(title: "\(Int(v)) 秒（网速；展开时 1 秒）", action: #selector(menuSetFreq(_:)), keyEquivalent: "")
             it.representedObject = v
             it.state = (abs(sampler.idleInterval - v) < 0.01) ? .on : .off
             sub.addItem(it)
@@ -3058,7 +3031,7 @@ private final class LiveBox {
     private var hist: [(rx: Double, tx: Double)] = []
     private var period = Sampler.PeriodStatistics(since: Date(), rxBytes: 0, txBytes: 0,
                                                   externalInterfaces: [], processes: [])
-    /// 不剔除代理核心的原始总量（代理穿透自检做对照用）
+    /// 物理 socket 原始速率，仅诊断，不参与应用累计。
     private var raw: (rx: Double, tx: Double) = (0, 0)
 
     func update(_ r: [Sampler.Row], _ a: Double, _ b: Double, _ c: Int,
@@ -3085,25 +3058,29 @@ private final class LiveBox {
 
 /// 采真实数据 N 秒后渲染，用来验证 UI 与解析链路是真的通了
 private func renderLiveSnapshot(to path: String, seconds: Double) {
+    let cpu0 = cpuSeconds(getpid()) ?? 0
+    let started = Date()
     let box = LiveBox()
     let s = Sampler()
     s.deliverQueue = DispatchQueue(label: "netball.live")
     s.onSnapshot = { rows, rx, tx, c, period in
         box.update(rows, rx, tx, c, raw: s.lastRawTotals, period: period)
     }
-    s.setActive(true)   // 渲染的是展开面板，按展开档跑（这样「代理」标才会出现）
+    s.setActive(true)   // 渲染展开面板，按展开档频率采样；收起时同样做归属。
     s.start()
 
     let deadline = Date().addingTimeInterval(seconds)
     while Date() < deadline {
         RunLoop.current.run(until: Date().addingTimeInterval(0.2))
     }
+    s.stop(waitForDetails: true)
+    s.deliverQueue.sync {}
     let (rows, rx, tx, count, hist, period) = box.snapshot
-    s.stop()
     FileHandle.standardError.write(
         "live: rows=\(rows.count) total=\(Fmt.rate(rx))/\(Fmt.rate(tx)) procs=\(count)\n".data(using: .utf8)!)
 
-    var i = 0
+    let wall = max(0.1, Date().timeIntervalSince(started))
+    let ownCPU = max(0, (cpuSeconds(getpid()) ?? cpu0) - cpu0) / wall * 100
     renderSnapshot(to: path, expanded: true) { v in
         v.rows = rows
         v.totalRx = rx
@@ -3111,9 +3088,12 @@ private func renderLiveSnapshot(to path: String, seconds: Double) {
         v.procCount = count
         v.history = hist
         v.periodStatistics = period
-        i += 1
+        v.selfCPU = ownCPU
+        v.nettopCPU = s.childCPUSeconds / wall * 100
+        v.selfMemMB = Double(footprintBytes(getpid())) / 1048576
+        v.intervalLabel = String(format: "%.0fs", s.interval)
+        v.detailIntervalLabel = String(format: "%.0fs", s.detailInterval)
     }
-    _ = i
 }
 
 // MARK: - 入口
@@ -3161,6 +3141,12 @@ if argv.contains("--ease-test") {
 }
 
 if argv.contains("--stats-test") {
+    SamplingPerformanceTests.run()
+    Sampler.runSchedulingTests()
+    AttributionSelfTests.run()
+    do { try ProxyProbeSelfTests.run() }
+    catch { fatalError("ProxyProbeSelfTests: \(error)") }
+    precondition(Sampler.nettopArguments == ["-x", "-n", "-L", "1", "-J", "interface,state,bytes_in,bytes_out", "-c"])
     precondition(ExternalInterfaceSnapshot.isExternalInterfaceName("en0"))
     precondition(ExternalInterfaceSnapshot.isExternalInterfaceName("en12"))
     precondition(!ExternalInterfaceSnapshot.isExternalInterfaceName("lo0"))
@@ -3219,13 +3205,6 @@ if argv.contains("--stats-test") {
     scroll.reset()
     precondition(scroll.consume(deltaY: 23, precise: true) == 0) // no stale fractional delta after reset
 
-    precondition(ProxyProbe.hasProxiedOutbound(chains: ["🇯🇵日本高速08|BGP|CTCU", "良心云"]))
-    precondition(!ProxyProbe.hasProxiedOutbound(chains: ["DIRECT"]))
-    precondition(!ProxyProbe.hasProxiedOutbound(chains: [" direct "]))
-    precondition(!ProxyProbe.hasProxiedOutbound(chains: ["REJECT"]))
-    precondition(!ProxyProbe.hasProxiedOutbound(chains: ["DIRECT", "良心云"]))
-    precondition(!ProxyProbe.hasProxiedOutbound(chains: []))
-    precondition(!ProxyProbe.hasProxiedOutbound(chains: nil))
 
     var hoverDwell = StatusHoverDwellState()
     precondition(!hoverDwell.update(isHovering: true, now: 0))
@@ -3296,7 +3275,7 @@ if argv.contains("--stats-test") {
                                               point: NSPoint(x: 60, y: 180), userData: nil)
     precondition(statisticsTooltip == "完整路径：\n/Users/me/Project/server.js")
 
-    print("统计/身份自检通过：en 网卡过滤与差分、总量独立于进程明细、loopback/utun 排除、同进程身份聚合、应用/脚本路径分组、Electron 包路径识别、Node 入口提取、uv 路径、代理路由过滤、命令行参数隐去、路径提示、滚动与累计排序/重置")
+    print("统计/身份自检通过：物理总量独立、连接归属与去重、API 故障/重启/重置基线、回环排除、应用合并、路径隐私、滚动与排序")
     exit(0)
 }
 
@@ -3355,15 +3334,15 @@ if argv.contains("--draw-cost") {
 }
 
 if argv.contains("--proxy-test") {
-    // 代理穿透自检：采集一段真实数据，展示外网接口总量，以及进程明细剔除代理核心前后差异。
-    // 取整段里进程流量最大的那一拍 —— 下载这类短时流量只出现在中间某几拍。
+    // 比较物理总量、非加总的 raw socket 诊断、以及归属后的应用明细。
+    // --idle 验证面板收起时仍归属；--report-json path 写累计结果供受控实验核对。
     _ = NSApplication.shared
     let secs = doubleArg("--proxy-test", 8)
     let box = LiveBox()
     let s = Sampler()
     s.deliverQueue = DispatchQueue(label: "netball.proxytest")
     s.setIntervals(idle: 1.0, active: 1.0)
-    s.setActive(true)
+    s.setActive(!argv.contains("--idle"))
     s.onSnapshot = { rows, rx, tx, n, period in
         box.update(rows, rx, tx, n, raw: s.lastRawTotals, period: period)
     }
@@ -3376,31 +3355,39 @@ if argv.contains("--proxy-test") {
         let cur = box.withRaw
         if cur.raw.rx + cur.raw.tx > best.raw.rx + best.raw.tx { best = cur }
     }
-    s.stop()
+    s.stop(waitForDetails: true)
+    s.deliverQueue.sync {}
 
-    print("控制器端点: \(s.proxy.endpointDesc ?? "没找到 —— 不做穿透，保持原样")")
-    print("代理核心 PID: \(s.proxy.corePIDs.sorted())  （只从进程明细中剔除）")
+    print("控制器端点: \(s.proxy.endpointDesc ?? "未找到 —— 不猜测代理应用归属")")
+    print("代理核心 PID: \(s.proxy.corePIDs.sorted())  （wire bytes 仅诊断，绝不加回明细）")
     print("走代理的 PID: \(s.proxy.proxiedPIDs.sorted())")
     print(String(format: "\n峰值那一刻："))
-    print(String(format: "  外网接口总量           ↓%-12@ ↑%-12@",
+    print(String(format: "  物理网卡外网总量       ↓%-12@ ↑%-12@",
                  Fmt.rate(best.rx) as NSString, Fmt.rate(best.tx) as NSString))
-    print(String(format: "  nettop 进程合计(未剔除) ↓%-12@ ↑%-12@",
-                 Fmt.rate(best.raw.rx) as NSString, Fmt.rate(best.raw.tx) as NSString))
-    let filteredRx = best.rows.reduce(0.0) { $0 + $1.rx }
-    let filteredTx = best.rows.reduce(0.0) { $0 + $1.tx }
-    print(String(format: "  进程明细(剔除核心后)   ↓%-12@ ↑%-12@   进程数 %d",
-                 Fmt.rate(filteredRx) as NSString, Fmt.rate(filteredTx) as NSString, best.count))
-    let rawProcessTotal = best.raw.rx + best.raw.tx
-    let filteredProcessTotal = filteredRx + filteredTx
-    if rawProcessTotal > 0 {
-        print(String(format: "  → 代理核心占进程明细原始量 %.0f%%（不影响上方外网总量）",
-                     (1 - filteredProcessTotal / rawProcessTotal) * 100))
-    }
-    print("\n排行（剔除后）:")
+    print(String(format: "  原始物理 socket（仅诊断）↓%-12@ ↑%-12@   应用数 %d",
+                 Fmt.rate(best.raw.rx) as NSString, Fmt.rate(best.raw.tx) as NSString, best.count))
+    let (_, _, _, _, _, period) = box.snapshot
+    print("归属状态: \(period.attributionStatus)")
+    print("\n应用排行（代理 payload + 去重直连，不含回环及核心 wire bytes）:")
     for r in best.rows.prefix(8) {
         print(String(format: "  %-24@ pid %-7d ↓%-11@ ↑%-11@%@",
                      r.name as NSString, r.pid, Fmt.rate(r.rx) as NSString,
                      Fmt.rate(r.tx) as NSString, (r.viaProxy ? "  [代理]" : "") as NSString))
+    }
+    print("累计：物理 ↓\(Fmt.bytes(period.rxBytes)) ↑\(Fmt.bytes(period.txBytes))；\(period.processes.count) 个应用身份")
+    if let index = argv.firstIndex(of: "--report-json"), index + 1 < argv.count {
+        let object: [String: Any] = [
+            "physicalRX": period.rxBytes, "physicalTX": period.txBytes,
+            "since": period.since.timeIntervalSince1970, "status": period.attributionStatus,
+            "processes": period.processes.map { process -> [String: Any] in
+                ["name": process.name, "path": process.fullPath ?? "", "rx": process.rxBytes,
+                 "tx": process.txBytes, "viaProxy": process.viaProxy]
+            }
+        ]
+        do {
+            let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: URL(fileURLWithPath: argv[index + 1]), options: .atomic)
+        } catch { fputs("归属报告写入失败: \(error)\n", stderr); exit(1) }
     }
     exit(0)
 }

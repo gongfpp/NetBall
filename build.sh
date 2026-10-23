@@ -7,7 +7,7 @@ APP="NetBall.app"
 
 echo "==> 编译"
 mkdir -p build .modulecache   # 模块缓存放本地：沙箱/CI 环境下默认缓存目录可能不可写
-swiftc -O -module-cache-path "$PWD/.modulecache" -o build/NetBall main.swift
+swiftc -O -module-cache-path "$PWD/.modulecache" -o build/NetBall main.swift TrafficAttribution.swift ProxyTrafficProbe.swift SamplingPerformance.swift
 
 echo "==> 打包 $APP"
 rm -rf "$APP"
