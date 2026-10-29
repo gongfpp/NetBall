@@ -111,8 +111,19 @@ private func footprintBytes(_ pid: pid_t) -> UInt64 {
 private func processIncarnation(_ pid: Int) -> String? {
     var info = proc_bsdinfo()
     let size = MemoryLayout<proc_bsdinfo>.size
-    guard proc_pidinfo(pid_t(pid), PROC_PIDTBSDINFO, 0, &info, Int32(size)) == size else { return nil }
-    return "\(pid):\(info.pbi_start_tvsec):\(info.pbi_start_tvusec)"
+    if proc_pidinfo(pid_t(pid), PROC_PIDTBSDINFO, 0, &info, Int32(size)) == size,
+       info.pbi_start_tvsec > 0 {
+        return processLifetime(pid: pid, bsdStart: (info.pbi_start_tvsec, info.pbi_start_tvusec), absoluteStart: nil)
+    }
+    // 部分进程无法读取 BSD 元数据时，仍可用内核提供的启动时钟验证同一生命周期。
+    // 两种接口均不可读就不猜 PID 身份，也不生成每轮变化的伪启动时间。
+    return processLifetime(pid: pid, bsdStart: nil, absoluteStart: rusageV6(pid_t(pid))?.ri_proc_start_abstime)
+}
+
+private func processLifetime(pid: Int, bsdStart: (UInt64, UInt64)?, absoluteStart: UInt64?) -> String? {
+    if let (seconds, micros) = bsdStart, seconds > 0 { return "\(pid):\(seconds):\(micros)" }
+    if let start = absoluteStart, start > 0 { return "\(pid):absolute:\(start)" }
+    return nil
 }
 
 /// 把 nettop 的通用 runtime 名称映射成可辨认的应用/项目身份，并为 uv 显示可执行文件路径。
@@ -338,6 +349,7 @@ private struct ExternalInterfaceSnapshot {
     struct Counters {
         var rx: UInt64 = 0
         var tx: UInt64 = 0
+        var identity: String? = nil
 
         mutating func add(rx: UInt64, tx: UInt64) {
             self.rx &+= rx
@@ -351,9 +363,10 @@ private struct ExternalInterfaceSnapshot {
     func delta(since previous: ExternalInterfaceSnapshot) -> Counters {
         var result = Counters()
         for (name, current) in byInterface {
-            guard let old = previous.byInterface[name] else { continue }
-            result.add(rx: current.rx >= old.rx ? current.rx - old.rx : 0,
-                       tx: current.tx >= old.tx ? current.tx - old.tx : 0)
+            guard let old = previous.byInterface[name], old.identity == current.identity,
+                  current.rx >= old.rx, current.tx >= old.tx else { continue }
+            // 同名接口重建或任一计数回退时整轮重建基线，不把设备历史或复位猜成流量。
+            result.add(rx: current.rx - old.rx, tx: current.tx - old.tx)
         }
         return result
     }
@@ -364,23 +377,110 @@ private struct ExternalInterfaceSnapshot {
     }
 
     static func read() -> ExternalInterfaceSnapshot? {
-        var first: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&first) == 0, let first else { return nil }
-        defer { freeifaddrs(first) }
-
-        var byInterface: [String: Counters] = [:]
-        var current: UnsafeMutablePointer<ifaddrs>? = first
-        while let entry = current?.pointee {
-            current = entry.ifa_next
-            guard let address = entry.ifa_addr,
-                  address.pointee.sa_family == sa_family_t(AF_LINK),
-                  let rawData = entry.ifa_data else { continue }
-            let name = String(cString: entry.ifa_name)
-            guard isExternalInterfaceName(name), (entry.ifa_flags & UInt32(IFF_UP)) != 0 else { continue }
-            let data = rawData.assumingMemoryBound(to: if_data.self).pointee
-            byInterface[name] = Counters(rx: UInt64(data.ifi_ibytes), tx: UInt64(data.ifi_obytes))
+        var mib: [Int32] = [CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0]
+        // 接口可能在两次 sysctl 之间增加；缓冲区不足就重新读取，不能把截断快照当成功。
+        for _ in 0..<3 {
+            var count = 0
+            guard sysctl(&mib, u_int(mib.count), nil, &count, nil, 0) == 0,
+                  count > 0, count <= 16 * 1024 * 1024 else { return nil }
+            var data = Data(count: count)
+            let result = data.withUnsafeMutableBytes { bytes in
+                sysctl(&mib, u_int(mib.count), bytes.baseAddress, &count, nil, 0)
+            }
+            if result == 0 {
+                guard count <= data.count else { return nil }
+                return parse(Data(data.prefix(count)))
+            }
+            if errno != ENOMEM { return nil }
         }
-        return ExternalInterfaceSnapshot(byInterface: byInterface)
+        return nil
+    }
+
+    /// NET_RT_IFLIST2 的 if_data64 才是真正的 64 位字节计数；扩大旧 if_data 类型无效。
+    static func parse(_ data: Data) -> ExternalInterfaceSnapshot? {
+        data.withUnsafeBytes { bytes -> ExternalInterfaceSnapshot? in
+            var byInterface: [String: Counters] = [:]
+            var offset = 0
+            while offset < bytes.count {
+                guard bytes.count - offset >= 4 else { return nil }
+                let length = Int(bytes.loadUnaligned(fromByteOffset: offset, as: UInt16.self))
+                guard length >= 4, length <= bytes.count - offset,
+                      bytes[offset + 2] == UInt8(RTM_VERSION) else { return nil }
+                defer { offset += length }
+                guard bytes[offset + 3] == UInt8(RTM_IFINFO2) else { continue }
+                let headerSize = MemoryLayout<if_msghdr2>.size
+                guard length >= headerSize + 8 else { return nil }
+                let header = bytes.loadUnaligned(fromByteOffset: offset, as: if_msghdr2.self)
+                guard (header.ifm_addrs & RTA_IFP) != 0 else { return nil }
+                let link = offset + headerSize
+                let linkLength = Int(bytes[link]), nameLength = Int(bytes[link + 5])
+                let addressLength = Int(bytes[link + 6])
+                guard linkLength >= 8, linkLength <= length - headerSize,
+                      bytes[link + 1] == UInt8(AF_LINK), nameLength > 0,
+                      8 + nameLength + addressLength <= linkLength,
+                      bytes.loadUnaligned(fromByteOffset: link + 2, as: UInt16.self) == header.ifm_index else { return nil }
+                let nameBytes = UnsafeRawBufferPointer(rebasing: bytes[(link + 8)..<(link + 8 + nameLength)])
+                guard let name = String(bytes: nameBytes, encoding: .utf8) else { return nil }
+                guard isExternalInterfaceName(name), (header.ifm_flags & IFF_UP) != 0 else { continue }
+                guard byInterface[name] == nil else { return nil }
+                let address = bytes[(link + 8 + nameLength)..<(link + 8 + nameLength + addressLength)]
+                    .map { String(format: "%02x", $0) }.joined()
+                let identity = "\(header.ifm_index):\(bytes[link + 4]):\(address)"
+                byInterface[name] = Counters(rx: header.ifm_data.ifi_ibytes, tx: header.ifm_data.ifi_obytes,
+                                             identity: identity)
+            }
+            return ExternalInterfaceSnapshot(byInterface: byInterface)
+        }
+    }
+
+    static func runTests() {
+        func message(_ name: String, index: UInt16 = 4, rx: UInt64, tx: UInt64 = 200,
+                     address: [UInt8] = [0, 1, 2, 3, 4, 5], up: Bool = true) -> Data {
+            let nameBytes = Array(name.utf8)
+            let linkLength = 8 + nameBytes.count + address.count
+            var header = if_msghdr2()
+            header.ifm_msglen = UInt16(MemoryLayout<if_msghdr2>.size + linkLength)
+            header.ifm_version = UInt8(RTM_VERSION)
+            header.ifm_type = UInt8(RTM_IFINFO2)
+            header.ifm_addrs = RTA_IFP
+            header.ifm_flags = up ? IFF_UP : 0
+            header.ifm_index = index
+            header.ifm_data.ifi_ibytes = rx
+            header.ifm_data.ifi_obytes = tx
+            var data = withUnsafeBytes(of: &header) { Data($0) }
+            var link: [UInt8] = [UInt8(linkLength), UInt8(AF_LINK), 0, 0, 6, UInt8(nameBytes.count), UInt8(address.count), 0]
+            withUnsafeBytes(of: index) { link.replaceSubrange(2..<4, with: $0) }
+            data.append(contentsOf: link + nameBytes + address)
+            return data
+        }
+        let beforeWrap = UInt64(UInt32.max) - 99
+        let old = parse(message("en0", rx: beforeWrap))!
+        let new = parse(message("en0", rx: beforeWrap + 200, tx: 250))!
+        precondition(new.delta(since: old).rx == 200 && new.delta(since: old).tx == 50)
+        precondition(new.byInterface["en0"]!.rx > UInt64(UInt32.max))
+        let replaced = parse(message("en0", index: 9, rx: beforeWrap + 999))!
+        precondition(replaced.delta(since: old).rx == 0)
+        let newAddress = parse(message("en0", rx: beforeWrap + 999, address: [6, 7, 8, 9, 10, 11]))!
+        precondition(newAddress.delta(since: old).rx == 0)
+        let reset = parse(message("en0", rx: 10, tx: 500))!
+        precondition(reset.delta(since: old).rx == 0 && reset.delta(since: old).tx == 0)
+        precondition(parse(message("lo0", rx: 999))!.byInterface.isEmpty)
+        precondition(parse(message("en0", rx: 999, up: false))!.byInterface.isEmpty)
+        let complete = message("en0", rx: 999)
+        for count in 1..<complete.count { precondition(parse(Data(complete.prefix(count))) == nil) }
+        precondition(parse(complete + complete) == nil)
+        var malformed = complete
+        malformed[0] = 0; malformed[1] = 0
+        precondition(parse(malformed) == nil)
+        malformed = complete; malformed[2] = 0
+        precondition(parse(malformed) == nil)
+        malformed = complete; malformed[MemoryLayout<if_msghdr2>.size + 5] = 250
+        precondition(parse(malformed) == nil)
+        precondition(processLifetime(pid: 12, bsdStart: (100, 2), absoluteStart: 999) == "12:100:2")
+        precondition(processLifetime(pid: 12, bsdStart: nil, absoluteStart: 999) == "12:absolute:999")
+        precondition(processLifetime(pid: 12, bsdStart: nil, absoluteStart: 0) == nil)
+        precondition(processLifetime(pid: 12, bsdStart: nil, absoluteStart: nil) == nil)
+        print("ExternalInterfaceTests: passed (64-bit, interface lifetime, reset, truncated messages, process birth fallback)")
     }
 }
 
@@ -557,6 +657,8 @@ final class Sampler {
     private var inFlight = false
     private var periodAccumulator = PeriodAccumulator()
     private let processIdentityResolver = ProcessIdentityResolver()
+    // 仅用于身份读取失败时保留旧 socket 基线；绝不据此认领该轮的应用流量。
+    private var verifiedLifetimes: [Int: String] = [:]
 
     /// 读取当前统计（与采样队列串行，避免跨线程读写竞态）
     func currentPeriodStatistics() -> PeriodStatistics {
@@ -678,14 +780,7 @@ final class Sampler {
     private func poll() {
         guard running else { return }
         let now = Date()
-        let elapsed = max(0.2, now.timeIntervalSince(lastTick))
-        lastTick = now
-        let current = ExternalInterfaceSnapshot.read()
-        var delta = ExternalInterfaceSnapshot.Counters()
-        if let current, let previousExternalSnapshot { delta = current.delta(since: previousExternalSnapshot) }
-        previousExternalSnapshot = current
-        periodAccumulator.addExternal(rx: delta.rx, tx: delta.tx, interfaces: current?.interfaceNames ?? [])
-        physicalRates = (Double(delta.rx) / elapsed, Double(delta.tx) / elapsed)
+        recordExternal(ExternalInterfaceSnapshot.read(), at: now)
         shots += 1
 
         if !inFlight, detailBudget.isDue(at: now) {
@@ -712,6 +807,17 @@ final class Sampler {
             }
         }
         publishSnapshot()
+    }
+
+    private func recordExternal(_ current: ExternalInterfaceSnapshot?, at now: Date) {
+        // 读取失败不是接口消失；保留上一成功基线及时间，下次成功仍能补齐物理字节。
+        guard let current else { physicalRates = (0, 0); return }
+        let elapsed = max(0.2, now.timeIntervalSince(lastTick))
+        let delta = previousExternalSnapshot.map { current.delta(since: $0) } ?? .init()
+        previousExternalSnapshot = current
+        lastTick = now
+        periodAccumulator.addExternal(rx: delta.rx, tx: delta.tx, interfaces: current.interfaceNames)
+        physicalRates = (Double(delta.rx) / elapsed, Double(delta.tx) / elapsed)
     }
 
     /// 只在轻量状态队列组装 UI 快照；连接队列即使阻塞也不影响顶部网速。
@@ -755,7 +861,15 @@ final class Sampler {
         let final = sampler.currentPeriodStatistics()
         precondition(sampler.detailScans == 1 && abs(sampler.childCPUSeconds - 0.1) < 0.0001)
         precondition(final.since == reset.since && final.processes.isEmpty && final.attributionStatus == "归属待采样")
-        print("SamplingSchedulingTests: passed (responsive physical/pause, no overlap, stale reset discarded)")
+        let physical = Sampler()
+        let time = Date(timeIntervalSince1970: 1_800_000_000)
+        physical.recordExternal(.init(byInterface: ["en0": .init(rx: 100, tx: 200)]), at: time)
+        physical.recordExternal(nil, at: time.addingTimeInterval(1))
+        physical.recordExternal(.init(byInterface: ["en0": .init(rx: 400, tx: 600)]), at: time.addingTimeInterval(3))
+        precondition(physical.currentPeriodStatistics().rxBytes == 300)
+        precondition(physical.currentPeriodStatistics().txBytes == 400)
+        precondition(abs(physical.physicalRates.rx - 100) < 0.001)
+        print("SamplingSchedulingTests: passed (responsive physical/pause, no overlap, stale reset discarded, failed-read recovery)")
     }
 
     private struct DetailSample {
@@ -778,13 +892,25 @@ final class Sampler {
         let ownBefore = cpuSeconds(getpid()) ?? 0
         let text = shot()
         let socketTime = Date()
-        var parsed = text.flatMap { text in
-            SocketTraffic.parseCSV(text) { pid, name in
-                let lifetime = processIncarnation(pid)
-                    ?? "\(pid):unverified:\(socketTime.timeIntervalSinceReferenceDate)"
-                return TrafficOwner(pid: pid, incarnation: lifetime, name: name)
+        var unverifiedPIDs: Set<Int> = [], observedPIDs: Set<Int> = []
+        let snapshot = text.flatMap { text in
+            SocketTraffic.parseSnapshotCSV(text) { pid, name in
+                observedPIDs.insert(pid)
+                if let lifetime = processIncarnation(pid) {
+                    verifiedLifetimes[pid] = lifetime
+                    return TrafficOwner(pid: pid, incarnation: lifetime, name: name)
+                }
+                unverifiedPIDs.insert(pid)
+                return TrafficOwner(pid: pid, incarnation: verifiedLifetimes[pid] ?? "\(pid):unverified", name: name)
             }
         }
+        var ambiguousIdentities = snapshot?.ambiguousIdentities ?? []
+        // 启动时间不可验证时只保留既有基线，既不把旧 PID 当作当前应用，也不回放失败区间。
+        for socket in snapshot?.sockets ?? [] where socket.owner.pid.map(unverifiedPIDs.contains) == true {
+            ambiguousIdentities.insert(socket.key)
+        }
+        if snapshot != nil { verifiedLifetimes = verifiedLifetimes.filter { observedPIDs.contains($0.key) } }
+        var parsed = snapshot?.sockets.filter { $0.owner.pid.map(unverifiedPIDs.contains) != true }
         if let sockets = parsed {
             let names = Dictionary(sockets.compactMap { socket -> (Int, String)? in
                 guard let pid = socket.owner.pid else { return nil }
@@ -804,9 +930,10 @@ final class Sampler {
         let proxySnapshot = proxy.poll(sockets: parsed, at: socketTime)
         let now = Date()
         let deltas = attribution.sample(sockets: parsed, proxy: proxySnapshot,
-                                       corePIDs: proxy.corePIDs, at: now)
+                                       corePIDs: proxy.corePIDs, at: now, ambiguousSocketIdentities: ambiguousIdentities)
         var status = proxy.status
         if parsed == nil { status = "进程归属不可用" }
+        else if !unverifiedPIDs.isEmpty { status = "部分进程身份不可读" }
         else if !attribution.diagnostics.isEmpty, proxySnapshot != nil {
             status = "代理归属不完整"
         }
@@ -3158,6 +3285,7 @@ if argv.contains("--ease-test") {
 
 if argv.contains("--stats-test") {
     SamplingPerformanceTests.run()
+    ExternalInterfaceSnapshot.runTests()
     Sampler.runSchedulingTests()
     AttributionSelfTests.run()
     do { try ProxyProbeSelfTests.run() }

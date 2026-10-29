@@ -16,14 +16,11 @@ final class ProxyTrafficProbe {
         var base: String { socket == nil ? "http://127.0.0.1:9090" : "http://localhost" }
         var description: String { socket ?? base }
         var identity: String {
-            guard let socket else { return "tcp:127.0.0.1:9090" }
-            // A recreated Unix socket is useful evidence even if root birth is unreadable.
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: socket),
-               let inode = attrs[.systemFileNumber] as? NSNumber,
-               let device = attrs[.systemNumber] as? NSNumber {
-                return "unix:\(socket):\(device):\(inode)"
-            }
-            return "unix:\(socket)"
+            let attrs = socket.flatMap { try? FileManager.default.attributesOfItem(atPath: $0) }
+            // Unix socket 的设备与 inode 是选中 controller 的证据，不关联其他核心。
+            return ProxyProbeLogic.endpointIdentity(socket: socket,
+                device: (attrs?[.systemNumber] as? NSNumber)?.uint64Value,
+                inode: (attrs?[.systemFileNumber] as? NSNumber)?.uint64Value)
         }
     }
 
@@ -41,6 +38,9 @@ final class ProxyTrafficProbe {
     private var nextCoreScan = Date.distantPast
     private var coreBirths: [Int: String] = [:]
     private var lastHealthyEndpointIdentity: String?
+    private var controllerListener: ProxyProbeLogic.ControllerListener?
+    private var controllerEpochState = ProxyProbeLogic.ControllerEpochState()
+    private var nextControllerScan = Date.distantPast
     private var localAddresses: Set<String> = []
     private var nextAddressScan = Date.distantPast
     private var appNames: [String: String] = [:]
@@ -67,8 +67,10 @@ final class ProxyTrafficProbe {
             nextConfiguration = now.addingTimeInterval(30)
             refreshedConfiguration = true
         }
-        guard let data = Self.request(selected, path: "/connections"),
-              let parsed = ProxyProbeLogic.parse(data) else {
+        let identityBefore = controllerIdentity(selected, at: now, discover: true)
+        guard let acquisition = ProxyProbeLogic.acquireConnections(request: {
+            Self.request(selected, path: "/connections")
+        }), let parsed = ProxyProbeLogic.parse(acquisition.data) else {
             endpoint = nil
             endpointDesc = nil
             configuration = Configuration()
@@ -82,15 +84,18 @@ final class ProxyTrafficProbe {
         discoveryBackoff = 2
         // Discovery may have found/restarted the core since the first scan. Refresh
         // before publishing healthy flows, not one tick after changing their epoch.
-        let identity = selected.identity
+        let identity = controllerIdentity(selected, at: now, discover: false)
+        // 请求横跨 socket 重建或已证明的 controller 换代时，不能把响应猜归任一代。
+        guard identity == identityBefore else {
+            proxiedPIDs = []
+            status = "代理归属不可用"
+            return nil
+        }
         let endpointChanged = lastHealthyEndpointIdentity != identity
         refreshCores(at: now, force: endpointChanged || (corePIDs.isEmpty && (hadCore || refreshedConfiguration)))
         lastHealthyEndpointIdentity = identity
-        let provenBirths = coreBirths.sorted { $0.key < $1.key }
-            .map { "\($0.key):\($0.value)" }.joined(separator: ",")
-        // Without reliable boot evidence do not invent a time-based epoch. The
-        // ledger also keys every flow by id+start, preventing reconnect deltas.
-        let epoch = provenBirths.isEmpty ? identity : identity + "|core:" + provenBirths
+        // 全局核心仅用于 raw 排除；其他代理启停不得改变选中 controller 的 epoch。
+        let epoch = identity
         let index = ProxyProbeLogic.SocketIndex(sockets ?? [])
         var executablePaths: [Int: String] = [:]
         var unreadablePIDs: Set<Int> = []
@@ -131,7 +136,57 @@ final class ProxyTrafficProbe {
             status = "代理已归属"
         }
         let tunEnabled = configuration.tunEnabled || parsed.connections.contains { $0.type.lowercased() == "tun" }
-        return ProxyTrafficSnapshot(epoch: epoch, flows: flows, tunEnabled: tunEnabled)
+        return ProxyTrafficSnapshot(epoch: epoch, flows: flows, tunEnabled: tunEnabled,
+                                    acquisitionStartedAt: acquisition.startedAt)
+    }
+
+    private func controllerIdentity(_ selected: Endpoint, at now: Date, discover: Bool) -> String {
+        let identity = ProxyProbeLogic.endpointIdentity(socket: selected.socket, device: nil, inode: nil)
+        guard selected.socket == nil else {
+            return controllerEpochState.resolve(identity: identity, verifiedEpoch: selected.identity)
+        }
+        // lsof 只按十秒节流发现候选；每轮用内核 fd 信息核验，不启动额外工具。
+        if discover && now >= nextControllerScan {
+            nextControllerScan = now.addingTimeInterval(10)
+            controllerListener = nil
+            if let data = Self.tool("/usr/sbin/lsof", ["-nP", "-a", "-iTCP:9090", "-sTCP:LISTEN", "-Fpfnt"],
+                                    timeout: 0.7, limit: 524_288),
+               let output = String(data: data, encoding: .utf8),
+               let candidate = ProxyProbeLogic.controllerCandidate(output),
+               let birth = Self.processBirth(candidate.pid),
+               let generation = Self.controllerSocketGeneration(pid: candidate.pid, fd: candidate.fd),
+               Self.processBirth(candidate.pid) == birth {
+                controllerListener = .init(pid: candidate.pid, fd: candidate.fd, birth: birth, generation: generation)
+            }
+        }
+        guard let listener = controllerListener else {
+            return controllerEpochState.resolve(identity: identity, verifiedEpoch: identity)
+        }
+        let birthBefore = Self.processBirth(listener.pid)
+        let generation = Self.controllerSocketGeneration(pid: listener.pid, fd: listener.fd)
+        let birthAfter = Self.processBirth(listener.pid)
+        let verified = ProxyProbeLogic.controllerEpoch(identity: identity, listener: listener,
+                                                       birthBefore: birthBefore, birthAfter: birthAfter,
+                                                       generation: generation)
+        return controllerEpochState.resolve(identity: identity, verifiedEpoch: verified)
+    }
+
+    private static func controllerSocketGeneration(pid: Int, fd: Int32) -> UInt64? {
+        guard pid > 0, pid <= Int(Int32.max), fd >= 0 else { return nil }
+        var info = socket_fdinfo()
+        let size = MemoryLayout<socket_fdinfo>.size
+        guard proc_pidfdinfo(pid_t(pid), fd, PROC_PIDFDSOCKETINFO, &info, Int32(size)) == Int32(size),
+              info.psi.soi_kind == SOCKINFO_TCP,
+              info.psi.soi_family == AF_INET,
+              info.psi.soi_options & Int16(SO_REUSEPORT) == 0 else { return nil }
+        let tcp = info.psi.soi_proto.pri_tcp
+        let address = UInt32(bigEndian: tcp.tcpsi_ini.insi_laddr.ina_46.i46a_addr4.s_addr)
+        let port = UInt16(bigEndian: UInt16(truncatingIfNeeded: tcp.tcpsi_ini.insi_lport))
+        // 仅接受选中 IPv4 controller 的精确地址或 IPv4 通配监听；不猜 IPv6 双栈。
+        guard tcp.tcpsi_state == TSI_S_LISTEN, port == 9090,
+              address == 0 || address == 0x7f000001,
+              tcp.tcpsi_ini.insi_gencnt != 0 else { return nil }
+        return tcp.tcpsi_ini.insi_gencnt
     }
 
     private func discover(at now: Date) -> Endpoint? {
@@ -154,7 +209,7 @@ final class ProxyTrafficProbe {
             endpoint = candidate
             endpointDesc = candidate.description
             nextConfiguration = .distantPast
-            // A freshly discovered endpoint must not retain another core's PID set.
+            // raw 排除需要全局核心集合，与此次选中的 controller 身份独立。
             refreshCores(at: now, force: true)
             return candidate
         }
@@ -359,6 +414,72 @@ final class ProxyTrafficProbe {
 /// Pure parser/mapping helpers. Tests inject executable/bundle lookups and local
 /// addresses: no network, subprocesses, file reads, or real PIDs in the self-tests.
 private enum ProxyProbeLogic {
+    static func endpointIdentity(socket: String?, device: UInt64?, inode: UInt64?) -> String {
+        guard let socket else { return "tcp:127.0.0.1:9090" }
+        guard let device, let inode else { return "unix:\(socket)" }
+        return "unix:\(socket):\(device):\(inode)"
+    }
+
+    struct ControllerEpochState {
+        private var selectedIdentity: String?
+        private var lastProvenEpoch: String?
+
+        mutating func resolve(identity: String, verifiedEpoch: String) -> String {
+            if selectedIdentity != identity {
+                selectedIdentity = identity
+                lastProvenEpoch = nil
+            }
+            // 暂时失去可读证据不是重启；只保留已证明的代际，不据此认领任何流 owner。
+            if verifiedEpoch != identity { lastProvenEpoch = verifiedEpoch }
+            return lastProvenEpoch ?? identity
+        }
+    }
+
+    struct ControllerListener {
+        let pid: Int
+        let fd: Int32
+        let birth: String
+        let generation: UInt64
+    }
+
+    static func controllerEpoch(identity: String, listener: ControllerListener,
+                                birthBefore: String?, birthAfter: String?, generation: UInt64?) -> String {
+        guard birthBefore == listener.birth, birthAfter == listener.birth,
+              generation == listener.generation else { return identity }
+        return identity + "|controller:\(listener.pid):\(listener.birth)"
+    }
+
+    static func controllerCandidate(_ output: String) -> (pid: Int, fd: Int32)? {
+        var pid: Int?
+        var fd: Int32?
+        var family: String?
+        var candidates: [(pid: Int, fd: Int32)] = []
+        for line in output.split(separator: "\n") {
+            switch line.first {
+            case "p": pid = Int(line.dropFirst()); fd = nil; family = nil
+            case "f": fd = Int32(line.dropFirst()); family = nil
+            case "t": family = String(line.dropFirst())
+            case "n":
+                guard let address = listener(String(line.dropFirst())), address.port == 9090,
+                      address.address == "127.0.0.1" || address.isUnspecified else { continue }
+                // 通配 IPv6、缺失字段或多个潜在 owner 都无法证明谁服务了 IPv4 请求。
+                guard family == "IPv4", let pid, pid > 0, let fd, fd >= 0 else { return nil }
+                candidates.append((pid, fd))
+            default: break
+            }
+        }
+        guard candidates.count == 1 else { return nil }
+        return candidates[0]
+    }
+
+    static func acquireConnections(request: () -> Data?, clock: () -> Date = Date.init)
+        -> (data: Data, startedAt: Date)? {
+        // 必须在实际请求之前取时钟；身份核验与 JSON 解析耗时不属于新流可计入窗口。
+        let startedAt = clock()
+        guard let data = request() else { return nil }
+        return (data, startedAt)
+    }
+
     struct Connection {
         let id: String
         let start: Date?
@@ -584,6 +705,78 @@ enum ProxyProbeSelfTests {
             guard let data = try? JSONSerialization.data(withJSONObject: ["connections": records]) else { return nil }
             return ProxyProbeLogic.parse(data)
         }
+        // Regression：身份只由选中端点/监听证据决定；不读取真实进程、服务或 socket。
+        let unixIdentity = ProxyProbeLogic.endpointIdentity(socket: "/test/controller.sock", device: 1, inode: 100)
+        try expect(unixIdentity == "unix:/test/controller.sock:1:100", "selected Unix inode identity")
+        try expect(unixIdentity != ProxyProbeLogic.endpointIdentity(socket: "/test/controller.sock", device: 1, inode: 101),
+                   "selected Unix socket recreation changes epoch")
+        try expect(ProxyProbeLogic.endpointIdentity(socket: "/test/controller.sock", device: nil, inode: nil) == "unix:/test/controller.sock",
+                   "unreadable Unix evidence does not invent birth")
+        let tcpIdentity = ProxyProbeLogic.endpointIdentity(socket: nil, device: nil, inode: nil)
+        let selectedListener = ProxyProbeLogic.ControllerListener(pid: 41, fd: 9, birth: "100.10", generation: 55)
+        func epoch(_ listener: ProxyProbeLogic.ControllerListener = selectedListener,
+                   before: String? = "100.10", after: String? = "100.10", generation: UInt64? = 55) -> String {
+            ProxyProbeLogic.controllerEpoch(identity: tcpIdentity, listener: listener,
+                                             birthBefore: before, birthAfter: after, generation: generation)
+        }
+        try expect(epoch() == "tcp:127.0.0.1:9090|controller:41:100.10", "TCP epoch uses proven selected listener birth only")
+        try expect(epoch(before: nil) == tcpIdentity && epoch(after: nil) == tcpIdentity,
+                   "unreadable birth cannot prove selected ownership")
+        try expect(epoch(after: "101.20") == tcpIdentity && epoch(generation: 56) == tcpIdentity,
+                   "PID or fd reuse cannot reuse controller proof")
+        let restartedListener = ProxyProbeLogic.ControllerListener(pid: 41, fd: 9, birth: "101.20", generation: 56)
+        try expect(epoch(restartedListener, before: "101.20", after: "101.20", generation: 56) != epoch(),
+                   "proven selected controller restart changes epoch")
+        var epochState = ProxyProbeLogic.ControllerEpochState()
+        try expect(epochState.resolve(identity: tcpIdentity, verifiedEpoch: epoch()) == epoch(), "cache proven selected epoch")
+        try expect(epochState.resolve(identity: tcpIdentity, verifiedEpoch: epoch(before: nil)) == epoch(),
+                   "temporary unreadable proof preserves selected epoch")
+        try expect(epochState.resolve(identity: tcpIdentity, verifiedEpoch: epoch()) == epoch(),
+                   "restored proof does not reset epoch a second time")
+        try expect(epochState.resolve(identity: tcpIdentity, verifiedEpoch: epoch(after: "101.20")) == epoch(),
+                   "unbound recycled PID cannot assert selected restart")
+        let restartedEpoch = epoch(restartedListener, before: "101.20", after: "101.20", generation: 56)
+        try expect(epochState.resolve(identity: tcpIdentity, verifiedEpoch: restartedEpoch) == restartedEpoch,
+                   "new proven selected birth replaces retained epoch")
+        let unixBase = ProxyProbeLogic.endpointIdentity(socket: "/test/controller.sock", device: nil, inode: nil)
+        try expect(epochState.resolve(identity: unixBase, verifiedEpoch: unixIdentity) == unixIdentity,
+                   "switching selected endpoint cannot inherit another controller birth")
+        try expect(epochState.resolve(identity: unixBase, verifiedEpoch: unixBase) == unixIdentity,
+                   "temporary unreadable Unix inode preserves proven epoch")
+        try expect(epochState.resolve(identity: unixBase, verifiedEpoch: unixIdentity) == unixIdentity,
+                   "restored Unix inode does not reset epoch")
+        let replacedUnix = ProxyProbeLogic.endpointIdentity(socket: "/test/controller.sock", device: 1, inode: 101)
+        try expect(epochState.resolve(identity: unixBase, verifiedEpoch: replacedUnix) == replacedUnix,
+                   "proven new selected Unix inode replaces cached evidence")
+        let selectedOutput = "p41\nf9\ntIPv4\nn127.0.0.1:9090\n"
+        let unrelatedOutput = "p99\nf12\ntIPv4\nn127.0.0.1:7897\n"
+        let candidate = ProxyProbeLogic.controllerCandidate(selectedOutput + unrelatedOutput)
+        try expect(candidate?.pid == 41 && candidate?.fd == 9,
+                   "unrelated proxy listeners do not change selected controller")
+        try expect(ProxyProbeLogic.controllerCandidate(selectedOutput)?.pid == candidate?.pid,
+                   "unrelated core disappearance cannot change selected evidence")
+        try expect(ProxyProbeLogic.controllerCandidate(unrelatedOutput) == nil, "proxy listener alone is not controller ownership")
+        try expect(ProxyProbeLogic.controllerCandidate(selectedOutput + "p99\nf12\ntIPv4\nn*:9090\n") == nil,
+                   "ambiguous controller ownership is not guessed")
+        try expect(ProxyProbeLogic.controllerCandidate("p41\nf9\ntIPv6\nn*:9090\n") == nil,
+                   "IPv6 wildcard does not prove selected IPv4 controller")
+        try expect(ProxyProbeLogic.controllerCandidate("p41\ntIPv4\nn127.0.0.1:9090\n") == nil,
+                   "missing fd does not prove controller ownership")
+        var acquisitionEvents: [String] = []
+        let requestStart = Date(timeIntervalSince1970: 100)
+        let acquired = ProxyProbeLogic.acquireConnections(request: {
+            acquisitionEvents.append("request")
+            return Data("{\"connections\":[]}".utf8)
+        }, clock: {
+            acquisitionEvents.append("clock")
+            return requestStart
+        })!
+        let snapshot = ProxyTrafficSnapshot(epoch: epoch(), flows: [], tunEnabled: false,
+                                            acquisitionStartedAt: acquired.startedAt)
+        try expect(acquisitionEvents == ["clock", "request"] && snapshot.acquisitionStartedAt == requestStart,
+                   "snapshot carries actual pre-request time, not post-identity resolution time")
+        try expect(ProxyProbeLogic.acquireConnections(request: { nil }, clock: { requestStart }) == nil,
+                   "failed request does not produce an acquisition")
         let node = TrafficOwner(pid: 41, incarnation: "41:birth", name: "worker.js", path: "/work/worker.js")
         let other = TrafficOwner(pid: 42, incarnation: "42:birth", name: "Other", path: "/opt/other")
         func socket(_ owner: TrafficOwner, local: String = "127.0.0.1", peer: String = "127.0.0.1",

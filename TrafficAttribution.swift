@@ -149,9 +149,13 @@ struct SocketTraffic {
         network == "udp" && remote.isUnspecified && remote.port == 0
     }
 
-    // nil means unusable output, not a successful empty snapshot. Process totals
-    // are deliberately ignored. Duplicate indistinguishable rows are all omitted.
+    // 保留旧调用接口；需要判定 socket 消失的调用方必须使用带歧义信息的快照。
     static func parseCSV(_ text: String, owner: (Int, String) -> TrafficOwner) -> [SocketTraffic]? {
+        parseSnapshotCSV(text, owner: owner)?.sockets
+    }
+
+    // nil 表示不可用而非健康空快照；重复行不计数，但仍证明该 identity 未明确消失。
+    static func parseSnapshotCSV(_ text: String, owner: (Int, String) -> TrafficOwner) -> SocketTrafficSnapshot? {
         guard let records = csvRecords(text) else { return nil }
         var header: [String]?
         var indices: [String: Int] = [:]
@@ -212,7 +216,8 @@ struct SocketTraffic {
             }
         }
         guard header != nil else { return nil }
-        return parsed.filter { frequencies[$0.key] == 1 }
+        return SocketTrafficSnapshot(sockets: parsed.filter { frequencies[$0.key] == 1 },
+                                     ambiguousIdentities: Set(frequencies.filter { $0.value > 1 }.map(\.key)))
     }
 
     fileprivate static func identityKey(owner: TrafficOwner, network: String, local: TrafficEndpoint,
@@ -267,6 +272,12 @@ struct SocketTraffic {
     }
 }
 
+// 歧义 identity 不产生字节，但不能被当作已关闭 socket 的证据。
+struct SocketTrafficSnapshot {
+    let sockets: [SocketTraffic]
+    let ambiguousIdentities: Set<String>
+}
+
 struct ProxyTraffic {
     let id: String
     let start: Date?
@@ -299,11 +310,13 @@ struct ProxyTrafficSnapshot {
     let epoch: String
     let flows: [ProxyTraffic]
     let tunEnabled: Bool
+    let acquisitionStartedAt: Date?
 
-    init(epoch: String, flows: [ProxyTraffic], tunEnabled: Bool) {
+    init(epoch: String, flows: [ProxyTraffic], tunEnabled: Bool, acquisitionStartedAt: Date? = nil) {
         self.epoch = epoch
         self.flows = flows
         self.tunEnabled = tunEnabled
+        self.acquisitionStartedAt = acquisitionStartedAt
     }
 }
 
@@ -347,12 +360,14 @@ struct AttributionLedger {
         var owner: TrafficOwner?
         var tuple: Tuple
         var coveredByAPI = false
+        var socketIdentity: String?
+        var needsRebaseline = false
     }
 
     private var socketBaselines: [String: Baseline] = [:]
     private var proxyBaselines: [ProxyKey: Baseline] = [:]
     private var proxyEpoch: String?
-    private var lastHealthyProxyAt: Date?
+    private var lastHealthyProxyBoundary: Date?
     private var resetAt: Date?
     private var lastProxyTuples: Set<Tuple> = []
     private var lastProxySources: Set<Source> = []
@@ -367,7 +382,7 @@ struct AttributionLedger {
         socketBaselines.removeAll()
         proxyBaselines.removeAll()
         proxyEpoch = nil
-        lastHealthyProxyAt = nil
+        lastHealthyProxyBoundary = nil
         resetAt = at
         lastProxyTuples.removeAll()
         lastProxySources.removeAll()
@@ -377,7 +392,8 @@ struct AttributionLedger {
     }
 
     mutating func sample(sockets: [SocketTraffic]?, proxy: ProxyTrafficSnapshot?,
-                         corePIDs: Set<Int>, at: Date) -> [TrafficDelta] {
+                         corePIDs: Set<Int>, at: Date,
+                         ambiguousSocketIdentities: Set<String> = []) -> [TrafficDelta] {
         diagnostics = []
         var result: [TrafficDelta] = []
         var apiTuples = lastProxyTuples
@@ -398,7 +414,7 @@ struct AttributionLedger {
                 // been counted. A newly discovered TUN flow cannot replay that gap.
                 diagnostics.append("tun-mode-changed-during-outage: unseen API flows rebaselined")
             }
-            let newFlowBoundary = epochChanged || uncertainTunTransition ? nil : (lastHealthyProxyAt ?? resetAt)
+            let newFlowBoundary = epochChanged || uncertainTunTransition ? nil : (lastHealthyProxyBoundary ?? resetAt)
             proxyEpoch = snapshot.epoch
             apiTuples = Set(snapshot.flows.map { Tuple(network: $0.network, source: $0.source, destination: $0.destination) })
             apiSources = Set(snapshot.flows.map { Source(network: $0.network, endpoint: $0.source) })
@@ -439,7 +455,10 @@ struct AttributionLedger {
                     proxyBaselines[key] = Baseline(rx: flow.rx, tx: flow.tx, at: at, owner: frozenOwner, tuple: tuple)
                 }
             }
-            lastHealthyProxyAt = at
+            // 请求开始后才出生的 flow 可能未进入本轮响应；下一轮应允许记首段。
+            // 兼容没有采集时间的调用；异常未来时间不可信，reset 和旧边界均不可倒退。
+            let acquiredAt = snapshot.acquisitionStartedAt.flatMap { $0 <= at ? $0 : nil } ?? at
+            lastHealthyProxyBoundary = [acquiredAt, lastHealthyProxyBoundary, resetAt].compactMap { $0 }.max()
             lastProxyTuples = apiTuples
             lastProxySources = apiSources
             lastTunEnabled = tunEnabled
@@ -454,17 +473,37 @@ struct AttributionLedger {
         }
 
         if let sockets {
-            // A duplicate row or caller-supplied key collision cannot silently
-            // overwrite another connection's baseline.
             let identityCounts = Dictionary(grouping: sockets, by: socketIdentity).mapValues(\.count)
             let keyCounts = Dictionary(grouping: sockets, by: socketBaselineKey).mapValues(\.count)
             let udpSources = Dictionary(grouping: sockets.filter {
                 $0.network == "udp" && isDirectCandidate($0, corePIDs: corePIDs)
             }) { Source(network: $0.network, endpoint: $0.local) }
+            var ambiguousIdentities = ambiguousSocketIdentities
+            ambiguousIdentities.formUnion(identityCounts.filter { $0.value > 1 }.map(\.key))
+            for socket in sockets where socket.isUnconnectedUDP {
+                let source = Source(network: socket.network, endpoint: socket.local)
+                if (udpSources[source]?.count ?? 0) > 1 { ambiguousIdentities.insert(socketIdentity(socket)) }
+            }
+            // 只有可信快照中的明确缺席才结束 incarnation；nil 或 parser 过滤的歧义行不能清 sticky。
+            let presentIdentities = Set(identityCounts.keys).union(ambiguousSocketIdentities)
+            socketBaselines = socketBaselines.filter { entry in
+                entry.value.socketIdentity.map { presentIdentities.contains($0) } ?? false
+            }
+            for key in Array(socketBaselines.keys) {
+                if let identity = socketBaselines[key]?.socketIdentity, ambiguousIdentities.contains(identity) {
+                    // 歧义区间不回放；仍然见到的 identity 不因歧义持续超过 TTL 而丢失覆盖。
+                    socketBaselines[key]?.needsRebaseline = true
+                    socketBaselines[key]?.at = at
+                }
+            }
+            if !ambiguousSocketIdentities.isEmpty {
+                diagnostics.append("ambiguous-socket-identity: duplicate rows excluded")
+            }
             var ambiguousSource = false
             for socket in sockets.sorted(by: { socketBaselineKey($0) < socketBaselineKey($1) }) {
                 let key = socketBaselineKey(socket)
-                guard identityCounts[socketIdentity(socket)] == 1, keyCounts[key] == 1 else {
+                guard identityCounts[socketIdentity(socket)] == 1, keyCounts[key] == 1,
+                      !ambiguousSocketIdentities.contains(socketIdentity(socket)) else {
                     diagnostics.append("ambiguous-socket-identity: duplicate rows excluded")
                     continue
                 }
@@ -472,10 +511,7 @@ struct AttributionLedger {
                 let tuple = Tuple(network: socket.network, source: socket.local, destination: socket.remote)
                 let source = Source(network: socket.network, endpoint: socket.local)
                 if socket.isUnconnectedUDP, (udpSources[source]?.count ?? 0) > 1 {
-                    // Without socket IDs a wildcard row might overlap a connected
-                    // sibling or another owner sharing this source. Never sum it
-                    // or later replay the ambiguous interval.
-                    socketBaselines.removeValue(forKey: key)
+                    // 通配 UDP 可能与同源 connected 行重叠；既不求和，也不清旧覆盖或回放歧义区间。
                     diagnostics.append("ambiguous-udp-source: unconnected UDP socket excluded")
                     continue
                 }
@@ -492,15 +528,17 @@ struct AttributionLedger {
                     // Coverage is sticky for this socket incarnation: an API flow
                     // may disappear and later reappear with its cumulative counter.
                     baseline.coveredByAPI = baseline.coveredByAPI || exactMatch || sourceMatch
-                    if !suppress && !baseline.coveredByAPI {
+                    if !suppress && !baseline.coveredByAPI && !baseline.needsRebaseline {
                         appendDelta(rx: socket.rx, tx: socket.tx, baseline: baseline,
                                     at: at, viaProxy: false, into: &result)
                     }
                     baseline.rx = socket.rx; baseline.tx = socket.tx; baseline.at = at
+                    baseline.needsRebaseline = false
                     socketBaselines[key] = baseline
                 } else {
                     socketBaselines[key] = Baseline(rx: socket.rx, tx: socket.tx, at: at, owner: socket.owner,
-                                                   tuple: tuple, coveredByAPI: exactMatch || sourceMatch)
+                                                   tuple: tuple, coveredByAPI: exactMatch || sourceMatch,
+                                                   socketIdentity: socketIdentity(socket))
                 }
             }
             if ambiguousSource {
@@ -603,8 +641,10 @@ enum AttributionSelfTests {
             ProxyTraffic(id: id, start: start.map(time), network: "tcp", type: type, source: source ?? local,
                          destination: destination ?? remote, owner: owner, rx: count, tx: count / 2, viaProxy: via)
         }
-        func snapshot(_ flows: [ProxyTraffic], epoch: String = "core-1", tun: Bool = false) -> ProxyTrafficSnapshot {
-            ProxyTrafficSnapshot(epoch: epoch, flows: flows, tunEnabled: tun)
+        func snapshot(_ flows: [ProxyTraffic], epoch: String = "core-1", tun: Bool = false,
+                      acquired: Double? = nil) -> ProxyTrafficSnapshot {
+            ProxyTrafficSnapshot(epoch: epoch, flows: flows, tunEnabled: tun,
+                                 acquisitionStartedAt: acquired.map(time))
         }
 
         check(TrafficEndpoint.parseNettop("1.2.3.4:443") == TrafficEndpoint(address: "1.2.3.4", port: 443), "IPv4 endpoint")
@@ -829,6 +869,88 @@ enum AttributionSelfTests {
         ledger = AttributionLedger()
         _ = ledger.sample(sockets: [udp(10), udp(20, owner: other)], proxy: snapshot([]), corePIDs: [], at: time(1))
         check(ledger.sample(sockets: [udp(30), udp(40, owner: other)], proxy: snapshot([]), corePIDs: [], at: time(2)).isEmpty, "shared UDP source across owners is not guessed")
+        // 原失效序列：明确消失后的同 tuple 是新生命周期，不能永久继承旧 API 覆盖。
+        for tun in [false, true] {
+            ledger = AttributionLedger()
+            _ = ledger.sample(sockets: [udp(100)], proxy: udpAPI(100, tun: tun), corePIDs: [], at: time(1))
+            _ = ledger.sample(sockets: [], proxy: snapshot([], tun: tun), corePIDs: [], at: time(2))
+            check(ledger.sample(sockets: [udp(1)], proxy: snapshot([], tun: tun), corePIDs: [], at: time(3)).isEmpty, "reused UDP tuple starts a fresh baseline after confirmed absence")
+            for (at, count) in [(4.0, UInt64(101)), (5.0, UInt64(201))] {
+                let direct = ledger.sample(sockets: [udp(count)], proxy: snapshot([], tun: tun), corePIDs: [], at: time(at))
+                check(amount(direct) == 100 && direct.first?.tx == 50 && direct.first?.viaProxy == false, "reused UDP tuple counts 100 each round instead of permanent zero")
+            }
+            // nil 不是空快照；API 空、失败、计数回退也都不能证明旧 socket 已消失。
+            ledger = AttributionLedger()
+            _ = ledger.sample(sockets: [udp(100)], proxy: udpAPI(100, tun: tun), corePIDs: [], at: time(1))
+            _ = ledger.sample(sockets: nil, proxy: snapshot([], tun: tun), corePIDs: [], at: time(2))
+            check(ledger.sample(sockets: [udp(1)], proxy: nil, corePIDs: [], at: time(3)).isEmpty, "unknown socket absence preserves sticky API coverage through rollback")
+            check(ledger.sample(sockets: [udp(101)], proxy: snapshot([], tun: tun), corePIDs: [], at: time(4)).isEmpty, "temporary empty API never replays an old covered socket")
+            check(amount(ledger.sample(sockets: [udp(201)], proxy: udpAPI(160, tun: tun), corePIDs: [], at: time(5))) == 60, "API recovery only adds the retained API delta")
+        }
+
+        func udpFrame(_ count: UInt64, duplicate: Bool = false) -> SocketTrafficSnapshot {
+            let row = "udp4 192.0.2.10:50000<->*:*,en0,,\(count),\(count / 2),\n"
+            let text = ",interface,state,bytes_in,bytes_out,\np.101,,,9999,9999,\n" + row + (duplicate ? row : "")
+            return SocketTraffic.parseSnapshotCSV(text, owner: { _, _ in app })!
+        }
+        func frameSample(_ frame: SocketTrafficSnapshot, proxy: ProxyTrafficSnapshot?, at: Double) -> [TrafficDelta] {
+            ledger.sample(sockets: frame.sockets, proxy: proxy, corePIDs: [], at: time(at),
+                          ambiguousSocketIdentities: frame.ambiguousIdentities)
+        }
+        let ambiguousFrame = udpFrame(200, duplicate: true)
+        check(ambiguousFrame.sockets.isEmpty && ambiguousFrame.ambiguousIdentities.count == 1, "parser retains duplicate identity evidence even when all rows are filtered")
+        ledger = AttributionLedger()
+        _ = frameSample(udpFrame(100), proxy: udpAPI(100, tun: false), at: 1)
+        _ = frameSample(ambiguousFrame, proxy: snapshot([]), at: 2)
+        check(frameSample(udpFrame(300), proxy: snapshot([]), at: 3).isEmpty, "filtered duplicates cannot clear sticky coverage")
+        check(frameSample(udpFrame(400), proxy: snapshot([]), at: 4).isEmpty, "sticky coverage survives duplicate recovery")
+        check(amount(frameSample(udpFrame(500), proxy: udpAPI(160, tun: false), at: 5)) == 60, "duplicate recovery never double counts retained API bytes")
+        _ = ledger.sample(sockets: [], proxy: snapshot([]), corePIDs: [], at: time(6))
+        _ = frameSample(udpFrame(1), proxy: snapshot([]), at: 7)
+        check(amount(frameSample(udpFrame(101), proxy: snapshot([]), at: 8)) == 100, "later trusted absence can release formerly ambiguous sticky coverage")
+        ledger = AttributionLedger()
+        _ = frameSample(udpFrame(100), proxy: snapshot([]), at: 1)
+        _ = frameSample(ambiguousFrame, proxy: snapshot([]), at: 2)
+        check(frameSample(udpFrame(300), proxy: snapshot([]), at: 3).isEmpty, "direct socket does not replay duplicate ambiguity interval")
+        check(amount(frameSample(udpFrame(400), proxy: snapshot([]), at: 4)) == 100, "direct socket resumes after duplicate rebaseline")
+        ledger = AttributionLedger()
+        _ = frameSample(udpFrame(100), proxy: udpAPI(100, tun: false), at: 1)
+        _ = frameSample(ambiguousFrame, proxy: snapshot([]), at: 100002)
+        _ = frameSample(udpFrame(300), proxy: snapshot([]), at: 100003)
+        check(frameSample(udpFrame(400), proxy: snapshot([]), at: 100004).isEmpty, "observed ambiguous identity retains sticky coverage even beyond tombstone TTL")
+        ledger = AttributionLedger()
+        _ = ledger.sample(sockets: [udp(100)], proxy: udpAPI(100, tun: false), corePIDs: [], at: time(1))
+        _ = ledger.sample(sockets: [udp(200), udp(201)], proxy: snapshot([]), corePIDs: [], at: time(2))
+        _ = ledger.sample(sockets: [udp(300)], proxy: snapshot([]), corePIDs: [], at: time(3))
+        check(ledger.sample(sockets: [udp(400)], proxy: snapshot([]), corePIDs: [], at: time(4)).isEmpty, "caller-supplied duplicates preserve sticky coverage too")
+        ledger = AttributionLedger()
+        _ = ledger.sample(sockets: [udp(100)], proxy: udpAPI(100, tun: false), corePIDs: [], at: time(1))
+        _ = ledger.sample(sockets: [udp(200), udp(200, destination: remote)], proxy: snapshot([]), corePIDs: [], at: time(2))
+        _ = ledger.sample(sockets: [udp(300)], proxy: snapshot([]), corePIDs: [], at: time(3))
+        check(ledger.sample(sockets: [udp(400)], proxy: snapshot([]), corePIDs: [], at: time(4)).isEmpty, "same-source UDP ambiguity cannot discard established sticky coverage")
+
+        // 本轮请求开始后出生、处理完成前未被响应捕获的 flow，下一轮仍可计首段。
+        ledger = AttributionLedger()
+        _ = ledger.sample(sockets: [], proxy: snapshot([flow(100, owner: app)], acquired: 8), corePIDs: [], at: time(10))
+        let lateStart = ledger.sample(sockets: [], proxy: snapshot([
+            flow(150, owner: app), flow(90, id: "unknown-start", start: nil),
+            flow(100, id: "late-born", start: 9, owner: app), flow(9000, id: "old-unseen", start: 7)
+        ], acquired: 11), corePIDs: [], at: time(12))
+        check(amount(lateStart) == 150 && lateStart.contains { $0.rx == 50 } && lateStart.contains { $0.rx == 100 }, "previous request window counts new first bytes without replaying an established or older flow")
+        let unknownStart = ledger.sample(sockets: [], proxy: snapshot([flow(100, id: "unknown-start", start: nil)], acquired: 12.5), corePIDs: [], at: time(13))
+        check(amount(unknownStart) == 10, "unknown start is baseline-only then counts future delta")
+        let missedWindow = ledger.sample(sockets: [], proxy: snapshot([flow(70, id: "next-window", start: 12.75)], acquired: 13.5), corePIDs: [], at: time(14))
+        check(amount(missedWindow) == 70, "each successful request preserves its own missed-birth window")
+        _ = ledger.sample(sockets: [], proxy: nil, corePIDs: [], at: time(15))
+        check(amount(ledger.sample(sockets: [], proxy: snapshot([flow(80, id: "outage-born", start: 14.5)], acquired: 15.5), corePIDs: [], at: time(16))) == 80, "API failure retains the last successful acquisition boundary")
+        ledger.reset(at: time(20))
+        check(ledger.sample(sockets: [], proxy: snapshot([flow(9999, id: "pre-reset", start: 19)], acquired: 18), corePIDs: [], at: time(21)).isEmpty, "in-flight pre-reset request cannot replay old bytes")
+        let resetWindow = ledger.sample(sockets: [], proxy: snapshot([flow(20, id: "reset-born", start: 20.5), flow(9999, id: "old-after-reset", start: 19.5)], acquired: 21.5), corePIDs: [], at: time(22))
+        check(amount(resetWindow) == 20, "request start is clamped at reset without losing post-reset first segment")
+        check(ledger.sample(sockets: [], proxy: snapshot([flow(9999, id: "epoch-born", start: 22.5)], epoch: "core-2", acquired: 22), corePIDs: [], at: time(23)).isEmpty, "request window never bypasses epoch rebaseline")
+        ledger = AttributionLedger()
+        _ = ledger.sample(sockets: [], proxy: snapshot([], acquired: 99), corePIDs: [], at: time(10))
+        check(amount(ledger.sample(sockets: [], proxy: snapshot([flow(10, start: 10.5)], acquired: 11), corePIDs: [], at: time(12))) == 10, "invalid future acquisition time falls back to processing boundary")
         print("AttributionSelfTests: passed")
     }
 }
