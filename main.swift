@@ -385,6 +385,8 @@ private struct ExternalInterfaceSnapshot {
 }
 
 final class Sampler {
+    static let unassignedTrafficName = "未归属流量"
+
     // 需要连接元组来做代理归属；读取回环仅用于匹配，绝不把回环原始字节加入明细。
     // 参数顺序和 -c 都经过实测：避免 nettop 在首次快照前忙等；保留累计字节，不用 -d。
     static let nettopArguments = ["-x", "-n", "-L", "1", "-J", "interface,state,bytes_in,bytes_out", "-c"]
@@ -399,6 +401,7 @@ final class Sampler {
         /// 这条流量是经代理出去的（ProxyProbe 打标）
         var viaProxy = false
         var total: Double { rx + tx }
+        var isUnassigned: Bool { name == Sampler.unassignedTrafficName && fullPath == nil }
     }
 
     struct ProcessTotal {
@@ -409,6 +412,7 @@ final class Sampler {
         var fullPath: String? = nil
         var totalBytes: UInt64 { rxBytes &+ txBytes }
         var identityKey: String { name + "\u{0}" + (fullPath ?? "") }
+        var isUnassigned: Bool { name == Sampler.unassignedTrafficName && fullPath == nil }
     }
 
     struct StatisticsSortState {
@@ -701,7 +705,7 @@ final class Sampler {
                     periodAccumulator.setAttributionStatus(sample.status)
                     for delta in sample.deltas {
                         let owner = delta.owner
-                        periodAccumulator.add(name: owner == .unknown ? "未归属代理流量" : owner.name,
+                        periodAccumulator.add(name: owner == .unknown ? Self.unassignedTrafficName : owner.name,
                                               rx: delta.rx, tx: delta.tx, viaProxy: delta.viaProxy, fullPath: owner.path)
                     }
                 }
@@ -811,7 +815,7 @@ final class Sampler {
         var byIdentity: [String: Row] = [:]
         for delta in deltas {
             let owner = delta.owner
-            let name = owner == .unknown ? "未归属代理流量" : owner.name
+            let name = owner == .unknown ? Sampler.unassignedTrafficName : owner.name
             let key = name + "\u{0}" + (owner.path ?? "")
             let previous = byIdentity[key]
             byIdentity[key] = Row(name: name, pid: previous?.pid ?? owner.pid ?? 0,
@@ -1503,8 +1507,10 @@ final class BallView: NSView {
         let fFoot = NSFont.systemFont(ofSize: 10, weight: .regular)
 
         text("外网流量", x: pad, y: 15, font: fTitle, color: Palette.text)
-        text(paused ? "已暂停" : periodStatistics.attributionStatus,
-             x: pad, y: 15, font: fSmall, color: Palette.dim, align: .right, boxWidth: w - 2 * pad)
+        if paused {
+            text("已暂停", x: pad, y: 15, font: fSmall, color: Palette.dim,
+                 align: .right, boxWidth: w - 2 * pad)
+        }
 
         text("↓ " + Fmt.rate(totalRx), x: pad, y: 42, font: fRate, color: Palette.cyan)
         text("↑ " + Fmt.rate(totalTx), x: pad, y: 42, font: fRate, color: Palette.amber,
@@ -1628,7 +1634,7 @@ final class BallView: NSView {
         text("↑ " + Fmt.bytes(periodStatistics.txBytes), x: x, y: 100,
              font: rate, color: Palette.amber, align: .right, boxWidth: width)
         let elapsed = Date().timeIntervalSince(periodStatistics.since)
-        text("统计时长 \(Fmt.duration(elapsed)) · \(periodStatistics.processes.count) 个应用身份",
+        text("统计时长 \(Fmt.duration(elapsed))",
              x: x, y: 128, font: foot, color: Palette.dim)
     }
 
@@ -1652,12 +1658,14 @@ final class BallView: NSView {
         let valX = rowRect.maxX - 12
         let nameX = dot.maxX + 9
         let labelRoom = max(20, valX - 148 - nameX)
-        let nameRoom = max(20, labelRoom - (p.viaProxy ? 43 : 0))
-        let hasDetail = p.fullPath != nil
+        let showClashContext = p.isUnassigned && p.viaProxy
+        let showProxyBadge = p.viaProxy && !p.isUnassigned
+        let nameRoom = max(20, labelRoom - (showProxyBadge ? 43 : 0))
+        let hasDetail = p.fullPath != nil || showClashContext
         let nameY = rowRect.minY + (hasDetail ? 4 : 9)
         let shown = truncated(p.name, font: fRow, maxWidth: nameRoom)
         let nameWidth = text(shown, x: nameX, y: nameY, font: fRow, color: Palette.text)
-        if p.viaProxy {
+        if showProxyBadge {
             let badge = NSRect(x: nameX + nameWidth + 5, y: nameY + 2, width: 34, height: 16)
             let badgePath = NSBezierPath(roundedRect: badge, xRadius: 8, yRadius: 8)
             Palette.cyan.withAlphaComponent(0.16).setFill()
@@ -1668,7 +1676,10 @@ final class BallView: NSView {
             centeredText("代理", in: badge, font: NSFont.systemFont(ofSize: 9, weight: .semibold),
                          color: Palette.cyan)
         }
-        if let fullPath = p.fullPath {
+        if showClashContext {
+            text("Clash", x: nameX, y: rowRect.minY + 20,
+                 font: NSFont.systemFont(ofSize: 9), color: Palette.dim)
+        } else if let fullPath = p.fullPath {
             drawIdentityPath(fullPath, x: nameX, y: rowRect.minY + 20, maxWidth: labelRoom)
         }
 
@@ -1745,12 +1756,14 @@ final class BallView: NSView {
         let labelRoom = max(20, valX - 148 - nameX)
         let fBadge = NSFont.systemFont(ofSize: 9.5, weight: .semibold)
         let badgeW = ("代理" as NSString).size(withAttributes: [.font: fBadge]).width + 11
-        let nameRoom = max(20, labelRoom - (r.viaProxy ? badgeW + 12 : 0))
-        let hasDetail = r.fullPath != nil
+        let showClashContext = r.isUnassigned && r.viaProxy
+        let showProxyBadge = r.viaProxy && !r.isUnassigned
+        let nameRoom = max(20, labelRoom - (showProxyBadge ? badgeW + 12 : 0))
+        let hasDetail = r.fullPath != nil || showClashContext
         let nameY = rowRect.minY + (hasDetail ? 4 : 11)
         let shown = truncated(r.name, font: fRow, maxWidth: nameRoom)
         let nameWidth = text(shown, x: nameX, y: nameY, font: fRow, color: Palette.text)
-        if r.viaProxy {
+        if showProxyBadge {
             // 行尾标「代理」：告诉用户这条流量是从代理出去的（不是直连）
             let br = NSRect(x: nameX + nameWidth + 6, y: nameY + 2, width: badgeW, height: 14)
             let path = NSBezierPath(roundedRect: br, xRadius: 7, yRadius: 7)
@@ -1761,7 +1774,10 @@ final class BallView: NSView {
             path.stroke()
             centeredText("代理", in: br, font: fBadge, color: Palette.cyan)
         }
-        if let fullPath = r.fullPath {
+        if showClashContext {
+            text("Clash", x: nameX, y: rowRect.minY + 20,
+                 font: NSFont.systemFont(ofSize: 9), color: Palette.dim)
+        } else if let fullPath = r.fullPath {
             drawIdentityPath(fullPath, x: nameX, y: rowRect.minY + 20, maxWidth: labelRoom)
         }
 
@@ -3429,12 +3445,13 @@ if let i = argv.firstIndex(of: "--snapshot"), i + 1 < argv.count {
             // 走 updateRates 而不是直接塞 totalRx/totalTx：弧线现在读的是缓动后的显示值，
             // 绕过它会让 --ball 快照画出一条空弧（这个坑踩过一次）
             v.updateRates(rx: mb(8.4), tx: mb(1.2))
-            v.procCount = 7
+            v.procCount = 8
             v.rows = [
                 Sampler.Row(name: "Google Chrome", pid: 45565, rx: mb(5.8), tx: kb(120), viaProxy: true),
                 Sampler.Row(name: "WeChat", pid: 52526, rx: mb(1.6), tx: kb(340)),
                 Sampler.Row(name: "node · server.js", pid: 798, rx: kb(210), tx: kb(64),
                             fullPath: NSHomeDirectory() + "/Developer/demo-api/server.js", viaProxy: true),
+                Sampler.Row(name: Sampler.unassignedTrafficName, pid: 0, rx: kb(112), tx: kb(4), viaProxy: true),
                 Sampler.Row(name: "Visual Studio Code", pid: 45599, rx: kb(96), tx: kb(18),
                             fullPath: "/Applications/Visual Studio Code.app", viaProxy: true),
                 Sampler.Row(name: "Dropbox", pid: 900, rx: kb(88), tx: kb(12)),
@@ -3455,6 +3472,8 @@ if let i = argv.firstIndex(of: "--snapshot"), i + 1 < argv.count {
                                           fullPath: NSHomeDirectory() + "/Developer/web-app"),
                     Sampler.ProcessTotal(name: "Visual Studio Code", rxBytes: 1_780_000_000, txBytes: 440_000_000, viaProxy: true,
                                           fullPath: "/Applications/Visual Studio Code.app"),
+                    Sampler.ProcessTotal(name: Sampler.unassignedTrafficName, rxBytes: 1_400_000_000,
+                                         txBytes: 3_400_000, viaProxy: true),
                     Sampler.ProcessTotal(name: "uv", rxBytes: 1_250_000_000, txBytes: 120_000, viaProxy: false,
                                           fullPath: NSHomeDirectory() + "/.local/bin/uv"),
                     Sampler.ProcessTotal(name: "Dropbox", rxBytes: 940_000_000, txBytes: 150_000_000, viaProxy: false),

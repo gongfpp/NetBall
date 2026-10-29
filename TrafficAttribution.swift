@@ -143,6 +143,12 @@ struct SocketTraffic {
         self.tx = tx
     }
 
+    // sendto/recvfrom UDP sockets can carry the whole remote session without a
+    // connected peer. nettop reports their peer as *:* (or *.*), not a zero flow.
+    var isUnconnectedUDP: Bool {
+        network == "udp" && remote.isUnspecified && remote.port == 0
+    }
+
     // nil means unusable output, not a successful empty snapshot. Process totals
     // are deliberately ignored. Duplicate indistinguishable rows are all omitted.
     static func parseCSV(_ text: String, owner: (Int, String) -> TrafficOwner) -> [SocketTraffic]? {
@@ -196,8 +202,12 @@ struct SocketTraffic {
             } else {
                 guard let dot = label.lastIndex(of: "."), dot != label.startIndex,
                       let pid = Int(label[label.index(after: dot)...]), pid > 0,
-                      record[interfaceIndex].isEmpty, record[stateIndex].isEmpty,
+                      record[stateIndex].isEmpty,
                       csvCounter(rxText) != nil, csvCounter(txText) != nil else { return nil }
+                // Current nettop can emit one process-summary row per interface,
+                // with `interface` populated (for example `en0`). These aggregate
+                // counters are deliberately ignored; accept them only as owner
+                // context for the following per-socket rows.
                 currentOwner = owner(pid, String(label[..<dot]))
             }
         }
@@ -448,6 +458,9 @@ struct AttributionLedger {
             // overwrite another connection's baseline.
             let identityCounts = Dictionary(grouping: sockets, by: socketIdentity).mapValues(\.count)
             let keyCounts = Dictionary(grouping: sockets, by: socketBaselineKey).mapValues(\.count)
+            let udpSources = Dictionary(grouping: sockets.filter {
+                $0.network == "udp" && isDirectCandidate($0, corePIDs: corePIDs)
+            }) { Source(network: $0.network, endpoint: $0.local) }
             var ambiguousSource = false
             for socket in sockets.sorted(by: { socketBaselineKey($0) < socketBaselineKey($1) }) {
                 let key = socketBaselineKey(socket)
@@ -458,9 +471,22 @@ struct AttributionLedger {
                 guard isDirectCandidate(socket, corePIDs: corePIDs) else { continue }
                 let tuple = Tuple(network: socket.network, source: socket.local, destination: socket.remote)
                 let source = Source(network: socket.network, endpoint: socket.local)
+                if socket.isUnconnectedUDP, (udpSources[source]?.count ?? 0) > 1 {
+                    // Without socket IDs a wildcard row might overlap a connected
+                    // sibling or another owner sharing this source. Never sum it
+                    // or later replay the ambiguous interval.
+                    socketBaselines.removeValue(forKey: key)
+                    diagnostics.append("ambiguous-udp-source: unconnected UDP socket excluded")
+                    continue
+                }
                 let exactMatch = apiTuples.contains(tuple)
-                let sourceMatch = tunEnabled && apiSources.contains(source)
-                if sourceMatch && !exactMatch { ambiguousSource = true }
+                // A wildcard UDP peer cannot match an API destination. Prefer its
+                // same-source API payload even for explicit (non-TUN) UDP proxies.
+                let sourceMatch = (tunEnabled || socket.isUnconnectedUDP) && apiSources.contains(source)
+                if sourceMatch && !exactMatch {
+                    if tunEnabled { ambiguousSource = true }
+                    else { diagnostics.append("udp-source-covered: API preferred over unconnected UDP") }
+                }
                 let suppress = exactMatch || sourceMatch || (tunEnabled && proxy == nil)
                 if var baseline = socketBaselines[key], baseline.tuple == tuple {
                     // Coverage is sticky for this socket incarnation: an API flow
@@ -510,13 +536,16 @@ struct AttributionLedger {
 
     private func isDirectCandidate(_ socket: SocketTraffic, corePIDs: Set<Int>) -> Bool {
         if let pid = socket.owner.pid, corePIDs.contains(pid) { return false }
+        // Only a concrete local endpoint on a physical interface qualifies.
+        // The peer exception is UDP-only; TCP listeners, unbound UDP and core
+        // sockets remain excluded, as do loopback and virtual interfaces.
         guard ["tcp", "udp"].contains(socket.network), socket.interface.hasPrefix("en"),
               !socket.interface.dropFirst(2).isEmpty,
               socket.interface.dropFirst(2).utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
               !socket.local.isLoopback, !socket.remote.isLoopback,
-              !socket.local.isUnspecified, !socket.remote.isUnspecified,
+              !socket.local.isUnspecified,
               socket.local.address != socket.remote.address,
-              (1...65535).contains(socket.remote.port),
+              (socket.isUnconnectedUDP || (!socket.remote.isUnspecified && (1...65535).contains(socket.remote.port))),
               (1...65535).contains(socket.local.port) else { return false }
         return true
     }
@@ -616,6 +645,15 @@ enum AttributionSelfTests {
         """
         let idleParsed = SocketTraffic.parseCSV(idleCSV) { TrafficOwner(pid: $0, incarnation: "\($0)@a", name: $1) }
         check(idleParsed?.count == 2 && idleParsed?[0].owner.pid == 1 && idleParsed?[1].owner.pid == 370, "real nettop wildcard/empty listener rows preserve owner and active counters")
+        let interfaceGroupedCSV = """
+        ,interface,state,bytes_in,bytes_out,
+        proxy-client.42,en0,,100,50,
+        proxy-client.42,utun4,,120,60,
+        tcp4 192.0.2.10:50000<->127.0.0.1:7897,en0,Established,100,50,
+        """
+        let interfaceGrouped = SocketTraffic.parseCSV(interfaceGroupedCSV) { TrafficOwner(pid: $0, incarnation: "\($0)@a", name: $1) }
+        check(interfaceGrouped?.count == 1 && interfaceGrouped?.first?.owner.pid == 42
+              && interfaceGrouped?.first?.rx == 100, "per-interface process summary rows provide owner context but never add their aggregate counters")
         let activeMissing = idleCSV + "\ntcp4 192.0.2.10:50002<->203.0.113.20:443,en0,Established,,,"
         let activeMalformed = idleCSV + "\ntcp4 192.0.2.10:50002<->203.0.113.20:443,en0,Established,nope,5,"
         check(SocketTraffic.parseCSV(activeMissing, owner: { _, _ in app }) == nil, "established TCP empty counters remain malformed")
@@ -733,6 +771,64 @@ enum AttributionSelfTests {
         check(amount(preTun) == 10, "known non-TUN API outage preserves unrelated physical direct accounting")
         let modeChanged = ledger.sample(sockets: [socket(30)], proxy: snapshot([flow(500, start: 1.5, owner: app)], tun: true), corePIDs: [], at: time(3))
         check(modeChanged.isEmpty && ledger.diagnostics.contains(where: { $0.hasPrefix("tun-mode-changed-during-outage") }), "TUN enabled invisibly during outage cannot replay already-counted physical history")
+        // UU Remote uses sendto/recvfrom: a live peer can legitimately be *:*.
+        let wildcard = TrafficEndpoint(address: "*", port: 0)
+        func udp(_ count: UInt64, owner: TrafficOwner? = nil, source: TrafficEndpoint? = nil,
+                 interface: String = "en0", destination: TrafficEndpoint? = nil) -> SocketTraffic {
+            socket(count, owner: owner, source: source, destination: destination ?? wildcard,
+                   interface: interface, network: "udp")
+        }
+        let udpCSV = ",interface,state,bytes_in,bytes_out,\nUURemote.101,,,999999,999999,\nudp4 192.0.2.10:50000<->*:*,en0,,1000,500,\nudp6 [2001:db8::10]:50001<->*.*,en0,,2000,1000,\n"
+        let udpParsed = SocketTraffic.parseCSV(udpCSV) { _, _ in app }
+        check(udpParsed?.count == 2 && udpParsed?.allSatisfy(\.isUnconnectedUDP) == true, "numeric IPv4/IPv6 unconnected UDP retained, process totals ignored")
+        ledger = AttributionLedger()
+        check(ledger.sample(sockets: udpParsed, proxy: snapshot([]), corePIDs: [], at: time(1)).isEmpty, "UDP first snapshot is baseline only")
+        let udpMore = udpParsed!.map { SocketTraffic(key: $0.key, owner: $0.owner, network: $0.network,
+            local: $0.local, remote: $0.remote, interface: $0.interface, rx: $0.rx + 180, tx: $0.tx + 90) }
+        let udpDelta = ledger.sample(sockets: udpMore, proxy: snapshot([]), corePIDs: [], at: time(3))
+        check(amount(udpDelta) == 360 && udpDelta.allSatisfy { $0.owner == app && $0.rxRate == 90 && $0.tx == 90 }, "physical unconnected UDP counts only per-socket future delta under its real owner")
+        ledger = AttributionLedger()
+        _ = ledger.sample(sockets: [udp(100)], proxy: snapshot([]), corePIDs: [], at: time(3))
+        check(ledger.sample(sockets: [udp(1)], proxy: snapshot([]), corePIDs: [], at: time(4)).isEmpty, "UDP rollback rebaselines")
+        check(amount(ledger.sample(sockets: [udp(11)], proxy: snapshot([]), corePIDs: [], at: time(5))) == 10, "UDP resumes after rollback")
+        ledger.reset(at: time(6))
+        check(ledger.sample(sockets: [udp(9999)], proxy: snapshot([]), corePIDs: [], at: time(7)).isEmpty, "UDP reset cannot replay history")
+        check(ledger.sample(sockets: [udp(10000, owner: reusedPID)], proxy: snapshot([]), corePIDs: [], at: time(8)).isEmpty, "UDP PID incarnation cannot inherit history")
+
+        ledger = AttributionLedger()
+        let unsafeUDP = [udp(100, source: client), udp(100, source: .init(address: "*", port: 50000)),
+                         udp(100, source: .init(address: local.address, port: 0)), udp(100, interface: "lo0"),
+                         udp(100, interface: "utun4"), udp(100, owner: core)]
+        _ = ledger.sample(sockets: unsafeUDP, proxy: snapshot([]), corePIDs: [900], at: time(1))
+        let unsafeMore = unsafeUDP.map { SocketTraffic(key: $0.key, owner: $0.owner, network: $0.network,
+            local: $0.local, remote: $0.remote, interface: $0.interface, rx: 200, tx: 100) }
+        check(ledger.sample(sockets: unsafeMore, proxy: snapshot([]), corePIDs: [900], at: time(2)).isEmpty, "UDP relaxation never admits wildcard local, IPC, virtual interfaces or core bytes")
+
+        func udpAPI(_ count: UInt64, tun: Bool) -> ProxyTrafficSnapshot {
+            snapshot([ProxyTraffic(id: "udp-api", start: time(0), network: "udp", type: tun ? "Tun" : "Socks5",
+                source: local, destination: remote, owner: app, rx: count, tx: count / 2, viaProxy: true)], tun: tun)
+        }
+        for tun in [false, true] {
+            ledger = AttributionLedger()
+            _ = ledger.sample(sockets: [udp(100)], proxy: udpAPI(100, tun: tun), corePIDs: [], at: time(1))
+            let covered = ledger.sample(sockets: [udp(200)], proxy: udpAPI(160, tun: tun), corePIDs: [], at: time(2))
+            check(amount(covered) == 60 && covered.allSatisfy(\.viaProxy), "UDP API source dedup applies to TUN and explicit proxies")
+            check(ledger.sample(sockets: [udp(300)], proxy: nil, corePIDs: [], at: time(3)).isEmpty, "UDP API outage cannot add covered raw counters")
+            check(ledger.sample(sockets: [udp(400)], proxy: snapshot([], tun: tun), corePIDs: [], at: time(4)).isEmpty, "UDP API coverage is sticky after flow disappears")
+        }
+        ledger = AttributionLedger()
+        _ = ledger.sample(sockets: [udp(10)], proxy: snapshot([flow(10, owner: app)]), corePIDs: [], at: time(1))
+        check(amount(ledger.sample(sockets: [udp(40)], proxy: snapshot([flow(30, owner: app)]), corePIDs: [], at: time(2))) == 50, "TCP API source never suppresses independent UDP")
+
+        ledger = AttributionLedger()
+        _ = ledger.sample(sockets: [udp(10)], proxy: snapshot([]), corePIDs: [], at: time(1))
+        let sibling = ledger.sample(sockets: [udp(100), udp(10, destination: remote)], proxy: snapshot([]), corePIDs: [], at: time(2))
+        check(sibling.isEmpty && ledger.diagnostics.contains(where: { $0.hasPrefix("ambiguous-udp-source") }), "wildcard/connected same-source ambiguity cannot double count")
+        check(ledger.sample(sockets: [udp(110)], proxy: snapshot([]), corePIDs: [], at: time(3)).isEmpty, "UDP ambiguity gap is not replayed")
+        check(amount(ledger.sample(sockets: [udp(120)], proxy: snapshot([]), corePIDs: [], at: time(4))) == 10, "UDP counts again after safe rebaseline")
+        ledger = AttributionLedger()
+        _ = ledger.sample(sockets: [udp(10), udp(20, owner: other)], proxy: snapshot([]), corePIDs: [], at: time(1))
+        check(ledger.sample(sockets: [udp(30), udp(40, owner: other)], proxy: snapshot([]), corePIDs: [], at: time(2)).isEmpty, "shared UDP source across owners is not guessed")
         print("AttributionSelfTests: passed")
     }
 }
