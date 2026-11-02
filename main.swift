@@ -625,6 +625,7 @@ final class Sampler {
 
     /// 回调：实时排行 / 速率 / 进程数 + 自启动或重置以来的累计统计
     var onSnapshot: (([Row], Double, Double, Int, PeriodStatistics) -> Void)?
+    private(set) var snapshotTime = Date()
     var deliverQueue = DispatchQueue.main
 
     private(set) var paused = false
@@ -806,7 +807,7 @@ final class Sampler {
                 }
             }
         }
-        publishSnapshot()
+        publishSnapshot(at: now)
     }
 
     private func recordExternal(_ current: ExternalInterfaceSnapshot?, at now: Date) {
@@ -821,13 +822,14 @@ final class Sampler {
     }
 
     /// 只在轻量状态队列组装 UI 快照；连接队列即使阻塞也不影响顶部网速。
-    private func publishSnapshot() {
+    private func publishSnapshot(at time: Date = Date()) {
         let rows = detailRows, rates = physicalRates
         let raw = detailRawTotals, core = detailCoreTotals
         let period = periodAccumulator.snapshot()
         let childCPU = childCPUSeconds, detailInterval = detailBudget.interval
         deliverQueue.async { [weak self] in
             guard let self else { return }
+            self.snapshotTime = time
             self.deliveredChildCPUSeconds = childCPU
             self.detailInterval = detailInterval
             self.lastRawTotals = raw
@@ -1062,8 +1064,8 @@ private enum Palette {
 
 private enum Metrics {
     static let ball: CGFloat = 140
-    static let panelW: CGFloat = 368
-    static let panelH: CGFloat = 436
+    static let panelW: CGFloat = 392
+    static let panelH: CGFloat = 522
     static let pad: CGFloat = 18
 }
 
@@ -1214,12 +1216,14 @@ enum DisplayMode: String {
 final class BallView: NSView {
     weak var controller: Controller?
 
-    var expanded = false
+    var expanded = false {
+        didSet { if !expanded { chartHoverX = nil } }
+    }
     var rows: [Sampler.Row] = []
     var totalRx = 0.0
     var totalTx = 0.0
     var procCount = 0
-    var history: [(rx: Double, tx: Double)] = []
+    var history: [PanelChartSample] = []
     var showPeriodStatistics = false
     var periodStatistics = Sampler.PeriodStatistics(since: Date(), rxBytes: 0, txBytes: 0,
                                                     externalInterfaces: [], processes: [])
@@ -1646,11 +1650,11 @@ final class BallView: NSView {
         if showPeriodStatistics {
             drawPeriodSummary(x: pad, width: w - 2 * pad, small: fSmall, rate: fRate, foot: fFoot)
         } else {
-            drawSparkline(NSRect(x: pad, y: 78, width: w - 2 * pad, height: 56), sk: sk)
+            drawSparkline(chartRect, sk: sk)
         }
 
         NSColor(white: 1, alpha: 0.10).setFill()
-        NSRect(x: pad, y: 146, width: w - 2 * pad, height: 1).fill()
+        NSRect(x: pad, y: 240, width: w - 2 * pad, height: 1).fill()
 
         drawPanelTab("实时", rect: liveTabRect, selected: !showPeriodStatistics, font: fSmall)
         drawPanelTab("统计", rect: statisticsTabRect, selected: showPeriodStatistics, font: fSmall)
@@ -1669,15 +1673,17 @@ final class BallView: NSView {
         } else {
             processHeading = "应用排行"
         }
-        text(processHeading, x: pad + 112, y: 154, font: fSmall, color: Palette.dim)
+        if showPeriodStatistics && periodStatistics.processes.count > 5 {
+            text(processHeading, x: pad + 112, y: 255, font: NSFont.systemFont(ofSize: 9), color: Palette.dim)
+        }
         let downloadTitle = showPeriodStatistics && statisticsSort.column == .download
             ? "下载 \(statisticsSort.ascending ? "↑" : "↓")" : "下载"
         let uploadTitle = showPeriodStatistics && statisticsSort.column == .upload
             ? "上传 \(statisticsSort.ascending ? "↑" : "↓")" : "上传"
-        text(downloadTitle, x: pad + 150, y: 154, font: fSmall,
+        text(downloadTitle, x: w - pad - 145, y: 255, font: fSmall,
              color: showPeriodStatistics && statisticsSort.column == .download ? Palette.cyan : Palette.dim,
              align: .right, boxWidth: 62)
-        text(uploadTitle, x: pad + 212, y: 154, font: fSmall,
+        text(uploadTitle, x: w - pad - 72, y: 255, font: fSmall,
              color: showPeriodStatistics && statisticsSort.column == .upload ? Palette.amber : Palette.dim,
              align: .right, boxWidth: 68)
 
@@ -1686,36 +1692,35 @@ final class BallView: NSView {
                 byUpload: statisticsSort.column == .upload, ascending: statisticsSort.ascending)
             let top = Array(sorted.dropFirst(statisticsScrollOffset).prefix(5))
             if top.isEmpty {
-                text("这段期间还没有流量", x: pad, y: 202, font: fRow, color: Palette.dim)
+                text("这段期间还没有流量", x: pad, y: 310, font: fRow, color: Palette.dim)
             } else {
-                let maxTotal = max(Double(top[0].totalBytes), 1)
+                let maxTotal = max(top.map { Double($0.totalBytes) }.max() ?? 0, 1)
                 for (i, p) in top.enumerated() {
-                    drawPeriodRow(p, index: i, y: 176 + CGFloat(i) * 46, maxTotal: maxTotal,
+                    drawPeriodRow(p, index: i, y: 285 + CGFloat(i) * 42, maxTotal: maxTotal,
                                   fRow: fRow, fVal: fVal, w: w, pad: pad, sk: sk)
                 }
             }
         } else {
             let top = Array(rows.prefix(5))
             if top.isEmpty {
-                text(paused ? "采樣已暫停" : "正在採樣…", x: pad, y: 200, font: fRow, color: Palette.dim)
+                text(paused ? "采樣已暫停" : "正在採樣…", x: pad, y: 310, font: fRow, color: Palette.dim)
             } else {
                 let maxTotal = max(top[0].total, 1)
                 for (i, r) in top.enumerated() {
-                    drawRow(r, index: i, y: 176 + CGFloat(i) * 46, maxTotal: maxTotal,
+                    drawRow(r, index: i, y: 285 + CGFloat(i) * 42, maxTotal: maxTotal,
                             fRow: fRow, fVal: fVal, w: w, pad: pad, sk: sk)
                 }
             }
         }
 
-        let foot = "CPU均值 \(Fmt.pct(selfCPU + nettopCPU)) · \(String(format: "%.0f", selfMemMB)) MB"
-            + " · 网速\(intervalLabel)/明细目标\(detailIntervalLabel)"
+        let foot = "CPU \(Fmt.pct(selfCPU + nettopCPU)) · \(String(format: "%.0f", selfMemMB)) MB"
         text(foot, x: pad, y: h - 22, font: fFoot, color: Palette.dim)
     }
 
-    private var liveTabRect: NSRect { NSRect(x: Metrics.pad, y: 151, width: 50, height: 22) }
-    private var statisticsTabRect: NSRect { NSRect(x: Metrics.pad + 54, y: 151, width: 50, height: 22) }
-    private var downloadSortRect: NSRect { NSRect(x: Metrics.pad + 150, y: 151, width: 62, height: 22) }
-    private var uploadSortRect: NSRect { NSRect(x: Metrics.pad + 212, y: 151, width: 68, height: 22) }
+    private var liveTabRect: NSRect { NSRect(x: Metrics.pad, y: 251, width: 50, height: 22) }
+    private var statisticsTabRect: NSRect { NSRect(x: Metrics.pad + 54, y: 251, width: 50, height: 22) }
+    private var downloadSortRect: NSRect { NSRect(x: Metrics.panelW - Metrics.pad - 145, y: 251, width: 65, height: 22) }
+    private var uploadSortRect: NSRect { NSRect(x: Metrics.panelW - Metrics.pad - 72, y: 251, width: 68, height: 22) }
     private var resetStatisticsRect: NSRect {
         NSRect(x: Metrics.panelW - Metrics.pad - 56, y: 78, width: 56, height: 22)
     }
@@ -1744,9 +1749,7 @@ final class BallView: NSView {
     }
 
     private func drawPeriodSummary(x: CGFloat, width: CGFloat, small: NSFont, rate: NSFont, foot: NSFont) {
-        let interfaces = periodStatistics.externalInterfaces
-        let interfaceLabel = interfaces.isEmpty ? "物理网卡不可用" : interfaces.joined(separator: "+")
-        text("外网累计（\(interfaceLabel)）· 自启动/重置起", x: x, y: 80, font: small, color: Palette.dim)
+        text("自启动/重置起", x: x, y: 80, font: small, color: Palette.dim)
         let resetPath = NSBezierPath(roundedRect: resetStatisticsRect, xRadius: 7, yRadius: 7)
         NSColor(white: 1, alpha: 0.07).setFill()
         resetPath.fill()
@@ -1756,175 +1759,214 @@ final class BallView: NSView {
         text("重置", x: resetStatisticsRect.minX, y: resetStatisticsRect.minY + 4,
              font: small, color: Palette.text, align: .center, boxWidth: resetStatisticsRect.width)
 
-        text("↓ " + Fmt.bytes(periodStatistics.rxBytes), x: x, y: 100,
+        text("↓ " + Fmt.bytes(periodStatistics.rxBytes), x: x, y: 130,
              font: rate, color: Palette.cyan)
-        text("↑ " + Fmt.bytes(periodStatistics.txBytes), x: x, y: 100,
+        text("↑ " + Fmt.bytes(periodStatistics.txBytes), x: x, y: 130,
              font: rate, color: Palette.amber, align: .right, boxWidth: width)
         let elapsed = Date().timeIntervalSince(periodStatistics.since)
         text("统计时长 \(Fmt.duration(elapsed))",
-             x: x, y: 128, font: foot, color: Palette.dim)
+             x: x, y: 186, font: foot, color: Palette.dim)
+    }
+
+    private let panelIcons = PanelIconCache()
+    var chartHoverX: CGFloat?
+    private var chartTracking: NSTrackingArea?
+    private var chartRect: NSRect {
+        NSRect(x: Metrics.pad + 28, y: 106, width: Metrics.panelW - Metrics.pad * 2 - 28, height: 100)
+    }
+
+    /// 样例数据也保留时间语义，不影响真实采样与统计。
+    func usePreviewHistory(_ values: [(rx: Double, tx: Double)]) {
+        let end = clock()
+        history = values.enumerated().map { index, value in
+            PanelChartSample(at: end.addingTimeInterval(Double(index - values.count + 1)), rx: value.rx, tx: value.tx)
+        }
+    }
+
+    func appendHistory(at time: Date, rx: Double, tx: Double) {
+        history.append(PanelChartSample(at: time, rx: rx, tx: tx))
+        history.removeAll { time.timeIntervalSince($0.at) > 60 }
+        if history.count > 256 { history.removeFirst(history.count - 256) }
     }
 
     private func drawPeriodRow(_ p: Sampler.ProcessTotal, index: Int, y: CGFloat, maxTotal: Double,
                                fRow: NSFont, fVal: NSFont, w: CGFloat, pad: CGFloat, sk: PanelSkin) {
-        let rowRect = NSRect(x: pad, y: y, width: w - 2 * pad, height: 40)
-        let rowAlpha = index < sk.rowFill.count ? sk.rowFill[index] : 0
-        if rowAlpha > 0 {
-            let rowPath = NSBezierPath(roundedRect: rowRect, xRadius: sk.rowRadius, yRadius: sk.rowRadius)
-            NSColor(white: 1, alpha: rowAlpha).setFill()
-            rowPath.fill()
-        } else {
-            NSColor(white: 1, alpha: 0.08).setFill()
-            NSRect(x: rowRect.minX, y: rowRect.minY - 3, width: rowRect.width, height: 1).fill()
-        }
-
-        let dot = NSRect(x: rowRect.minX + 12, y: rowRect.minY + 12, width: 15, height: 15)
-        Palette.iconColors[stableHash(p.name) % Palette.iconColors.count].setFill()
-        NSBezierPath(ovalIn: dot).fill()
-
-        let valX = rowRect.maxX - 12
-        let nameX = dot.maxX + 9
-        let labelRoom = max(20, valX - 148 - nameX)
-        let showClashContext = p.isUnassigned && p.viaProxy
-        let showProxyBadge = p.viaProxy && !p.isUnassigned
-        let nameRoom = max(20, labelRoom - (showProxyBadge ? 43 : 0))
-        let hasDetail = p.fullPath != nil || showClashContext
-        let nameY = rowRect.minY + (hasDetail ? 4 : 9)
-        let shown = truncated(p.name, font: fRow, maxWidth: nameRoom)
-        let nameWidth = text(shown, x: nameX, y: nameY, font: fRow, color: Palette.text)
-        if showProxyBadge {
-            let badge = NSRect(x: nameX + nameWidth + 5, y: nameY + 2, width: 34, height: 16)
-            let badgePath = NSBezierPath(roundedRect: badge, xRadius: 8, yRadius: 8)
-            Palette.cyan.withAlphaComponent(0.16).setFill()
-            badgePath.fill()
-            Palette.cyan.withAlphaComponent(0.65).setStroke()
-            badgePath.lineWidth = 1
-            badgePath.stroke()
-            centeredText("代理", in: badge, font: NSFont.systemFont(ofSize: 9, weight: .semibold),
-                         color: Palette.cyan)
-        }
-        if showClashContext {
-            text("Clash", x: nameX, y: rowRect.minY + 20,
-                 font: NSFont.systemFont(ofSize: 9), color: Palette.dim)
-        } else if let fullPath = p.fullPath {
-            drawIdentityPath(fullPath, x: nameX, y: rowRect.minY + 20, maxWidth: labelRoom)
-        }
-
-        let trackY = rowRect.minY + (hasDetail ? 35 : 32)
-        let track = NSRect(x: rowRect.minX + 36, y: trackY,
-                           width: rowRect.width - 48, height: 3)
-        NSColor(white: 1, alpha: 0.07).setFill()
-        NSBezierPath(roundedRect: track, xRadius: 1.5, yRadius: 1.5).fill()
-        let ratio = min(CGFloat(Double(p.totalBytes) / maxTotal), 1)
-        let fill = NSRect(x: track.minX, y: track.minY, width: track.width * ratio, height: track.height)
-        Palette.cyan.withAlphaComponent(0.78).setFill()
-        NSBezierPath(roundedRect: fill, xRadius: 1.5, yRadius: 1.5).fill()
-
-        text(Fmt.bytes(p.rxBytes), x: valX - 148, y: rowRect.minY + 11, font: fVal,
-             color: Palette.cyan, align: .right, boxWidth: 70)
-        text(Fmt.bytes(p.txBytes), x: valX - 70, y: rowRect.minY + 11, font: fVal,
-             color: Palette.amber, align: .right, boxWidth: 70)
-    }
-
-    private func drawSparkline(_ r: NSRect, sk: PanelSkin) {
-        guard history.count > 1 else { return }
-        let n = history.count
-        let maxV = max(history.map { max($0.rx, $0.tx) }.max() ?? 1, 1024)
-
-        func path(_ pick: (Double, Double) -> Double) -> NSBezierPath {
-            let p = NSBezierPath()
-            p.lineWidth = 1.6
-            for (i, s) in history.enumerated() {
-                let x = r.minX + r.width * CGFloat(i) / CGFloat(max(n - 1, 1))
-                let y = r.maxY - r.height * CGFloat(min(pick(s.rx, s.tx) / maxV, 1.0))
-                i == 0 ? p.move(to: NSPoint(x: x, y: y)) : p.line(to: NSPoint(x: x, y: y))
-            }
-            return p
-        }
-
-        if sk.areaFill > 0 {
-            let area = path { rx, _ in rx }
-            area.line(to: NSPoint(x: r.maxX, y: r.maxY))
-            area.line(to: NSPoint(x: r.minX, y: r.maxY))
-            area.close()
-            Palette.cyan.withAlphaComponent(sk.areaFill).setFill()
-            area.fill()
-        }
-
-        Palette.cyan.setStroke()
-        path { rx, _ in rx }.stroke()
-        Palette.amber.setStroke()
-        path { _, tx in tx }.stroke()
-
-        NSColor(white: 1, alpha: 0.08).setFill()
-        NSRect(x: r.minX, y: r.maxY - 0.5, width: r.width, height: 1).fill()
+        drawApplicationRow(name: p.name, path: p.fullPath, proxy: p.viaProxy, unassigned: p.isUnassigned,
+                           rx: Fmt.bytes(p.rxBytes), tx: Fmt.bytes(p.txBytes), ratio: Double(p.totalBytes) / maxTotal,
+                           index: index, y: y, fRow: fRow, fVal: fVal, w: w, pad: pad, sk: sk)
     }
 
     private func drawRow(_ r: Sampler.Row, index: Int, y: CGFloat, maxTotal: Double,
                          fRow: NSFont, fVal: NSFont, w: CGFloat, pad: CGFloat, sk: PanelSkin) {
-        let rowRect = NSRect(x: pad, y: y, width: w - 2 * pad, height: 40)
-        let rowAlpha = index < sk.rowFill.count ? sk.rowFill[index] : 0
-        if rowAlpha > 0 {
-            let rowPath = NSBezierPath(roundedRect: rowRect, xRadius: sk.rowRadius, yRadius: sk.rowRadius)
-            NSColor(white: 1, alpha: rowAlpha).setFill()
-            rowPath.fill()
+        drawApplicationRow(name: r.name, path: r.fullPath, proxy: r.viaProxy, unassigned: r.isUnassigned,
+                           rx: Fmt.rate(r.rx), tx: Fmt.rate(r.tx), ratio: r.total / maxTotal,
+                           index: index, y: y, fRow: fRow, fVal: fVal, w: w, pad: pad, sk: sk)
+    }
+
+    /// 实时与累计共享列宽，路径留在悬停提示，不再挤占名称。
+    private func drawApplicationRow(name: String, path: String?, proxy: Bool, unassigned: Bool,
+                                    rx: String, tx: String, ratio: Double, index: Int, y: CGFloat,
+                                    fRow: NSFont, fVal: NSFont, w: CGFloat, pad: CGFloat, sk: PanelSkin) {
+        let row = NSRect(x: pad, y: y, width: w - 2 * pad, height: 40)
+        NSColor(white: 1, alpha: index < sk.rowFill.count ? sk.rowFill[index] : 0.04).setFill()
+        NSBezierPath(roundedRect: row, xRadius: 9, yRadius: 9).fill()
+        let icon = NSRect(x: row.minX + 9, y: y + 9, width: 22, height: 22)
+        if let image = panelIcons.image(for: path) {
+            image.draw(in: icon, from: .zero, operation: .sourceOver, fraction: 1,
+                       respectFlipped: true, hints: [.interpolation: NSImageInterpolation.high])
         } else {
-            NSColor(white: 1, alpha: 0.08).setFill()
-            NSRect(x: rowRect.minX, y: rowRect.minY - 3, width: rowRect.width, height: 1).fill()
+            let color = Palette.iconColors[stableHash(name) % Palette.iconColors.count]
+            color.withAlphaComponent(0.20).setFill()
+            NSBezierPath(roundedRect: icon, xRadius: 6, yRadius: 6).fill()
+            let symbol = unassigned ? "?" : (name.hasPrefix("node") ? "N" : String(name.prefix(1)).uppercased())
+            centeredText(symbol, in: icon, font: .systemFont(ofSize: 12, weight: .semibold), color: color)
         }
-
-        let dot = NSRect(x: rowRect.minX + 12, y: rowRect.minY + 12, width: 15, height: 15)
-        let color = Palette.iconColors[stableHash(r.name) % Palette.iconColors.count]
-        color.setFill()
-        NSBezierPath(ovalIn: dot).fill()
-
-        let nameX = dot.maxX + 9
-        let valX = rowRect.maxX - 12
-        let labelRoom = max(20, valX - 148 - nameX)
-        let fBadge = NSFont.systemFont(ofSize: 9.5, weight: .semibold)
-        let badgeW = ("代理" as NSString).size(withAttributes: [.font: fBadge]).width + 11
-        let showClashContext = r.isUnassigned && r.viaProxy
-        let showProxyBadge = r.viaProxy && !r.isUnassigned
-        let nameRoom = max(20, labelRoom - (showProxyBadge ? badgeW + 12 : 0))
-        let hasDetail = r.fullPath != nil || showClashContext
-        let nameY = rowRect.minY + (hasDetail ? 4 : 11)
-        let shown = truncated(r.name, font: fRow, maxWidth: nameRoom)
-        let nameWidth = text(shown, x: nameX, y: nameY, font: fRow, color: Palette.text)
-        if showProxyBadge {
-            // 行尾标「代理」：告诉用户这条流量是从代理出去的（不是直连）
-            let br = NSRect(x: nameX + nameWidth + 6, y: nameY + 2, width: badgeW, height: 14)
-            let path = NSBezierPath(roundedRect: br, xRadius: 7, yRadius: 7)
-            Palette.cyan.withAlphaComponent(0.16).setFill()
-            path.fill()
-            Palette.cyan.withAlphaComponent(0.7).setStroke()
-            path.lineWidth = 1
-            path.stroke()
-            centeredText("代理", in: br, font: fBadge, color: Palette.cyan)
+        let nameX = icon.maxX + 9
+        let valueStart = row.maxX - 145
+        let badgeWidth: CGFloat = proxy ? 25 : 0
+        let room = max(12, valueStart - nameX - badgeWidth - 8)
+        text(truncated(name, font: fRow, maxWidth: room), x: nameX, y: y + 10,
+             font: fRow, color: Palette.text)
+        if proxy {
+            let badge = NSRect(x: valueStart - 28, y: y + 12, width: 24, height: 14)
+            Palette.cyan.withAlphaComponent(0.14).setFill()
+            NSBezierPath(roundedRect: badge, xRadius: 4, yRadius: 4).fill()
+            centeredText("代理", in: badge, font: .systemFont(ofSize: 8.5, weight: .medium), color: Palette.cyan)
         }
-        if showClashContext {
-            text("Clash", x: nameX, y: rowRect.minY + 20,
-                 font: NSFont.systemFont(ofSize: 9), color: Palette.dim)
-        } else if let fullPath = r.fullPath {
-            drawIdentityPath(fullPath, x: nameX, y: rowRect.minY + 20, maxWidth: labelRoom)
+        drawColumnValue(rx, x: valueStart, y: y, font: fVal, color: Palette.cyan)
+        drawColumnValue(tx, x: valueStart + 73, y: y, font: fVal, color: Palette.amber)
+        let track = NSRect(x: nameX, y: y + 34, width: row.maxX - 9 - nameX, height: 2)
+        NSColor(white: 1, alpha: 0.05).setFill()
+        NSBezierPath(roundedRect: track, xRadius: 1, yRadius: 1).fill()
+        if ratio.isFinite && ratio > 0 {
+            Palette.cyan.withAlphaComponent(0.65).setFill()
+            NSBezierPath(roundedRect: NSRect(x: track.minX, y: track.minY,
+                                             width: track.width * CGFloat(min(1, ratio)), height: 2),
+                         xRadius: 1, yRadius: 1).fill()
         }
+    }
 
-        text(Fmt.rate(r.rx), x: valX - 148, y: rowRect.minY + 12, font: fVal, color: Palette.cyan,
-             align: .right, boxWidth: 70)
-        text(Fmt.rate(r.tx), x: valX - 70, y: rowRect.minY + 12, font: fVal, color: Palette.amber,
-             align: .right, boxWidth: 70)
-
-        // 占比：极简款画细线，其它款画圆角条
-        let frac = CGFloat(min(r.total / maxTotal, 1.0))
-        let barW = (w - 2 * pad - 40) * frac
-        if barW > 1 {
-            let h: CGFloat = 3
-            let barY = rowRect.minY + (hasDetail ? 35 : 28)
-            let bar = NSBezierPath(roundedRect: NSRect(x: dot.maxX + 9, y: barY,
-                                                       width: barW, height: h),
-                                   xRadius: h / 2, yRadius: h / 2)
-            Palette.cyan.withAlphaComponent(0.75).setFill()
-            bar.fill()
+    /// 数值列固定边界，长读数缩字而不挤进相邻列或代理标记。
+    static func columnValueFont(_ value: String, font: NSFont, width: CGFloat = 65) -> NSFont {
+        var size = min(10.5, font.pointSize)
+        var fitted = NSFont.monospacedDigitSystemFont(ofSize: size, weight: .semibold)
+        // 系统字体的光学尺寸与像素取整并非严格等比，缩字后重新实测。
+        for _ in 0..<16 {
+            let measured = (value as NSString).size(withAttributes: [.font: fitted]).width
+            if measured <= width { break }
+            size = max(1, size * min(0.95, (width - 0.25) / measured))
+            fitted = NSFont.monospacedDigitSystemFont(ofSize: size, weight: .semibold)
         }
+        return fitted
+    }
+
+    private func drawColumnValue(_ value: String, x: CGFloat, y: CGFloat, font: NSFont, color: NSColor) {
+        let fitted = Self.columnValueFont(value, font: font)
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: NSRect(x: x, y: y + 4, width: 65, height: 28)).addClip()
+        text(value, x: x, y: y + 11 + (12.5 - fitted.pointSize) / 2,
+             font: fitted, color: color, align: .right, boxWidth: 65)
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    private func drawSparkline(_ r: NSRect, sk: PanelSkin) {
+        let model = PanelChartModel(samples: history, end: clock())
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
+        text(model.unitLabel, x: r.minX, y: r.minY - 18, font: font, color: Palette.dim)
+        func axisLabel(_ value: Double) -> String {
+            let scaled = value / model.unitDivisor
+            return String(format: scaled == scaled.rounded() ? "%.0f" : "%.1f", scaled)
+        }
+        for value in [model.tickValues[0], model.tickValues[2], model.tickValues[4]] {
+            let y = r.maxY - r.height * CGFloat(value / model.maxValue)
+            NSColor(white: 1, alpha: 0.08).setStroke()
+            let line = NSBezierPath()
+            line.move(to: NSPoint(x: r.minX, y: y)); line.line(to: NSPoint(x: r.maxX, y: y))
+            line.lineWidth = 0.5; line.stroke()
+            text(axisLabel(value), x: Metrics.pad - 1, y: y - 6,
+                 font: font, color: Palette.dim, align: .right, boxWidth: 22)
+        }
+        for (fraction, label) in [(0.0, "-60s"), (0.5, "-30s"), (1.0, "0")] {
+            let x = r.minX + r.width * fraction
+            let width: CGFloat = 32
+            text(label, x: min(r.maxX - width, max(r.minX, x - width / 2)), y: r.maxY + 7,
+                 font: font, color: Palette.dim, align: fraction == 1 ? .right : .left, boxWidth: width)
+        }
+        func point(_ sample: PanelChartSample, _ value: Double) -> NSPoint {
+            NSPoint(x: r.minX + r.width * model.pointX(for: sample),
+                    y: r.maxY - r.height * CGFloat(min(1, value / model.maxValue)))
+        }
+        for (pick, color) in [({ (s: PanelChartSample) in s.rx }, Palette.cyan),
+                              ({ (s: PanelChartSample) in s.tx }, Palette.amber)] {
+            for segment in model.segments {
+                guard let first = segment.first, let last = segment.last else { continue }
+                let line = NSBezierPath(); line.lineWidth = 1.6
+                for (index, sample) in segment.enumerated() {
+                    let p = point(sample, pick(sample))
+                    if index == 0 { line.move(to: p) } else { line.line(to: p) }
+                }
+                if segment.count == 1 {
+                    let p = point(first, pick(first))
+                    color.setFill(); NSBezierPath(ovalIn: NSRect(x: p.x - 1.5, y: p.y - 1.5, width: 3, height: 3)).fill()
+                } else {
+                    let area = line.copy() as! NSBezierPath
+                    area.line(to: NSPoint(x: point(last, 0).x, y: r.maxY))
+                    area.line(to: NSPoint(x: point(first, 0).x, y: r.maxY)); area.close()
+                    color.withAlphaComponent(min(sk.areaFill, 0.09)).setFill(); area.fill()
+                    color.setStroke(); line.stroke()
+                }
+            }
+        }
+        if let peak = model.peak, max(peak.rx, peak.tx) > 0, chartHoverX == nil {
+            let value = max(peak.rx, peak.tx)
+            let color = peak.rx >= peak.tx ? Palette.cyan : Palette.amber
+            let p = point(peak, value)
+            color.setFill(); NSBezierPath(ovalIn: NSRect(x: p.x - 2.5, y: p.y - 2.5, width: 5, height: 5)).fill()
+            let label = axisLabel(value)
+            let labelWidth = (label as NSString).size(withAttributes: [.font: font]).width
+            text(label, x: min(r.maxX - labelWidth, max(r.minX, p.x + 6)),
+                 y: max(r.minY - 13, p.y - 16), font: font, color: color)
+        }
+        if let x = chartHoverX, let sample = model.nearest(at: Double((x - r.minX) / r.width)) {
+            let selectedX = point(sample, 0).x
+            Palette.text.withAlphaComponent(0.32).setStroke()
+            let line = NSBezierPath(); line.move(to: NSPoint(x: selectedX, y: r.minY)); line.line(to: NSPoint(x: selectedX, y: r.maxY))
+            line.lineWidth = 0.7; line.stroke()
+            for (value, color) in [(sample.rx, Palette.cyan), (sample.tx, Palette.amber)] {
+                let p = point(sample, value)
+                color.setFill(); NSBezierPath(ovalIn: NSRect(x: p.x - 3, y: p.y - 3, width: 6, height: 6)).fill()
+            }
+            let bubble = NSRect(x: min(r.maxX - 130, max(r.minX, selectedX - 140)), y: r.minY + 7, width: 130, height: 59)
+            NSColor(srgbRed: 0.09, green: 0.12, blue: 0.15, alpha: 0.97).setFill()
+            NSBezierPath(roundedRect: bubble, xRadius: 8, yRadius: 8).fill()
+            let date = Calendar.current.dateComponents([.hour, .minute, .second], from: sample.at)
+            let time = String(format: "%02d:%02d:%02d", date.hour ?? 0, date.minute ?? 0, date.second ?? 0)
+            text(time, x: bubble.minX + 10, y: bubble.minY + 6, font: font, color: Palette.dim)
+            text("↓ " + Fmt.rate(sample.rx), x: bubble.minX + 10, y: bubble.minY + 23, font: font, color: Palette.cyan)
+            text("↑ " + Fmt.rate(sample.tx), x: bubble.minX + 10, y: bubble.minY + 39, font: font, color: Palette.amber)
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.acceptsMouseMovedEvents = true
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let chartTracking { removeTrackingArea(chartTracking) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        addTrackingArea(area); chartTracking = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let next = expanded && !showPeriodStatistics && chartRect.contains(point) ? point.x : nil
+        if next != chartHoverX { chartHoverX = next; needsDisplay = true }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if chartHoverX != nil { chartHoverX = nil; needsDisplay = true }
     }
 
     @discardableResult
@@ -2034,6 +2076,7 @@ final class BallView: NSView {
                 return
             }
         }
+        if expanded && chartRect.contains(convert(event.locationInWindow, from: nil)) { return }
         controller?.toggleExpanded()
     }
 
@@ -2041,9 +2084,9 @@ final class BallView: NSView {
         super.resetCursorRects()
         removeAllToolTips()
         guard expanded else { return }
-        addToolTip(NSRect(x: Metrics.pad, y: 172, width: Metrics.panelW - 2 * Metrics.pad, height: 232),
+        addToolTip(NSRect(x: Metrics.pad, y: 285, width: Metrics.panelW - 2 * Metrics.pad, height: 208),
                        owner: self, userData: nil)
-        addToolTip(NSRect(x: Metrics.pad, y: Metrics.panelH - 30, width: Metrics.panelW - 2 * Metrics.pad, height: 30),
+        addToolTip(NSRect(x: Metrics.pad, y: Metrics.panelH - 24, width: Metrics.panelW - 2 * Metrics.pad, height: 24),
                    owner: self, userData: nil)
         addCursorRect(liveTabRect, cursor: .pointingHand)
         addCursorRect(statisticsTabRect, cursor: .pointingHand)
@@ -2057,24 +2100,28 @@ final class BallView: NSView {
     @objc func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag,
                     point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
         guard view === self, expanded else { return "" }
-        if point.y >= Metrics.panelH - 30 {
-            return "最近约30秒 CPU均值（100%=一个核心）：自身 \(Fmt.pct(selfCPU)) + 采集工具 \(Fmt.pct(nettopCPU))。\n内存仅为主程序；不含子进程或 WindowServer。\n明细间隔是CPU预算目标；受网速档位、扫描用时与调度影响，实际可能更久。明细速率为扫描区间平均值。"
+        if point.y >= Metrics.panelH - 24 {
+            return "最近约30秒 CPU均值（100%=一个核心）：自身 \(Fmt.pct(selfCPU)) + 采集工具 \(Fmt.pct(nettopCPU))。\n内存仅为主程序；不含子进程或 WindowServer。\n明细间隔是CPU预算目标；受网速档位、扫描用时与调度影响，实际可能更久。明细速率为扫描区间平均值。\n网速\(intervalLabel)；明细目标\(detailIntervalLabel)。"
         }
-        let offset = point.y - 176
+        let offset = point.y - 285
         guard offset >= 0 else { return "" }
-        let index = Int(offset / 46)
-        let withinRow = offset - CGFloat(index) * 46
+        let index = Int(offset / 42)
+        let withinRow = offset - CGFloat(index) * 42
         guard index < 5, withinRow < 40 else { return "" }
 
         let fullPath: String?
+        let unassigned: Bool
         if showPeriodStatistics {
             let sorted = periodStatistics.sortedProcesses(
                 byUpload: statisticsSort.column == .upload, ascending: statisticsSort.ascending)
             let processIndex = statisticsScrollOffset + index
             fullPath = processIndex < sorted.count ? sorted[processIndex].fullPath : nil
+            unassigned = processIndex < sorted.count && sorted[processIndex].isUnassigned && sorted[processIndex].viaProxy
         } else {
             fullPath = index < rows.count ? rows[index].fullPath : nil
+            unassigned = index < rows.count && rows[index].isUnassigned && rows[index].viaProxy
         }
+        if unassigned { return "Clash：尚不能确认具体应用的代理连接；不是物理总量减去明细的剩余值。" }
         guard let fullPath else { return "" }
         return "完整路径：\n\(fullPath)"
     }
@@ -2085,7 +2132,7 @@ final class BallView: NSView {
             return
         }
         let point = convert(event.locationInWindow, from: nil)
-        guard point.y >= 172 && point.y < Metrics.panelH - 24 else {
+        guard point.y >= 285 && point.y < 493 else {
             statisticsScrollAccumulator.reset()
             super.scrollWheel(with: event)
             return
@@ -2280,8 +2327,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let (urx, utx) = self.animDemo ? self.syntheticRates() : (rx, tx)
             self.view.updateRates(rx: urx, tx: utx)
             self.view.procCount = count
-            self.view.history.append((rx: urx, tx: utx))
-            if self.view.history.count > 60 { self.view.history.removeFirst(self.view.history.count - 60) }
+            self.view.appendHistory(at: self.sampler.snapshotTime, rx: urx, tx: utx)
             self.view.recomputePeaks()
             self.view.needsDisplay = true
             self.startArcAnimation()
@@ -2881,6 +2927,7 @@ private func renderSnapshot(to path: String, expanded: Bool, fill: (BallView) ->
     v.selfMemMB = 21
     v.intervalLabel = "1s"
     fill(v)
+    if CommandLine.arguments.contains("--hover") { v.chartHoverX = Metrics.panelW - Metrics.pad - 75 }
     v.recomputePeaks()
     v.settleAnimation()
 
@@ -2977,7 +3024,7 @@ private func renderBallSnapshot(to path: String, demo: Bool) {
                     let uf = max(0.15, 0.95 + 0.5 * cos(t / 3.1))
                     hist.append((rx: refRx * 1048576 * df, tx: refTx * 1048576 * uf))
                 }
-                v.history = hist
+                v.usePreviewHistory(hist)
                 v.recomputePeaks()
                 v.settleAnimation()
                 let originX = CGFloat(i) * colW + (colW - size.width * scale) / 2
@@ -3040,7 +3087,7 @@ private func renderBallSnapshot(to path: String, demo: Bool) {
             v.ballStyle = st
             v.paused = false
             v.updateRates(rx: demo ? 8.4 * 1048576 : 0, tx: demo ? 1.2 * 1048576 : 0)
-            v.history = demo ? demoHistory() : []
+            v.usePreviewHistory(demo ? demoHistory() : [])
             v.recomputePeaks()
             v.settleAnimation()
 
@@ -3171,23 +3218,25 @@ private final class LiveBox {
     private var rx = 0.0
     private var tx = 0.0
     private var count = 0
-    private var hist: [(rx: Double, tx: Double)] = []
+    private var hist: [PanelChartSample] = []
     private var period = Sampler.PeriodStatistics(since: Date(), rxBytes: 0, txBytes: 0,
                                                   externalInterfaces: [], processes: [])
     /// 物理 socket 原始速率，仅诊断，不参与应用累计。
     private var raw: (rx: Double, tx: Double) = (0, 0)
 
     func update(_ r: [Sampler.Row], _ a: Double, _ b: Double, _ c: Int,
-                raw: (rx: Double, tx: Double) = (0, 0),
+                raw: (rx: Double, tx: Double) = (0, 0), at time: Date = Date(),
                 period: Sampler.PeriodStatistics? = nil) {
         lock.lock(); defer { lock.unlock() }
         rows = r; rx = a; tx = b; count = c; self.raw = raw
         if let period { self.period = period }
-        hist.append((rx: a, tx: b))
-        if hist.count > 60 { hist.removeFirst(hist.count - 60) }
+        let now = time
+        hist.append(PanelChartSample(at: now, rx: a, tx: b))
+        hist.removeAll { now.timeIntervalSince($0.at) > 60 }
+        if hist.count > 256 { hist.removeFirst(hist.count - 256) }
     }
 
-    var snapshot: ([Sampler.Row], Double, Double, Int, [(rx: Double, tx: Double)], Sampler.PeriodStatistics) {
+    var snapshot: ([Sampler.Row], Double, Double, Int, [PanelChartSample], Sampler.PeriodStatistics) {
         lock.lock(); defer { lock.unlock() }
         return (rows, rx, tx, count, hist, period)
     }
@@ -3207,7 +3256,7 @@ private func renderLiveSnapshot(to path: String, seconds: Double) {
     let s = Sampler()
     s.deliverQueue = DispatchQueue(label: "netball.live")
     s.onSnapshot = { rows, rx, tx, c, period in
-        box.update(rows, rx, tx, c, raw: s.lastRawTotals, period: period)
+        box.update(rows, rx, tx, c, raw: s.lastRawTotals, at: s.snapshotTime, period: period)
     }
     s.setActive(true)   // 渲染展开面板，按展开档频率采样；收起时同样做归属。
     s.start()
@@ -3284,6 +3333,15 @@ if argv.contains("--ease-test") {
 }
 
 if argv.contains("--stats-test") {
+    let presentationFailures = PanelPresentationTests.run()
+    precondition(presentationFailures.isEmpty, presentationFailures.joined(separator: "\n"))
+    let columnFont = NSFont.monospacedDigitSystemFont(ofSize: 12.5, weight: .semibold)
+    for value in ["1023.9 KB/s", "1000.0 MB/s", "16777216.00 TB", "0 B/s"] {
+        let fitted = BallView.columnValueFont(value, font: columnFont)
+        precondition((value as NSString).size(withAttributes: [.font: fitted]).width <= 65.01,
+                     "数值越过列边界：\(value)")
+    }
+    print("面板图表/图标缓存/数值列宽自检通过")
     SamplingPerformanceTests.run()
     ExternalInterfaceSnapshot.runTests()
     Sampler.runSchedulingTests()
@@ -3408,7 +3466,7 @@ if argv.contains("--stats-test") {
     tooltipView.rows = [Sampler.Row(name: "node · server.js", pid: 1, rx: 10, tx: 0,
                                     fullPath: "/Users/me/Project/server.js")]
     let liveTooltip = tooltipView.view(tooltipView, stringForToolTip: 0,
-                                       point: NSPoint(x: 60, y: 180), userData: nil)
+                                       point: NSPoint(x: 60, y: 290), userData: nil)
     precondition(liveTooltip == "完整路径：\n/Users/me/Project/server.js")
     tooltipView.showPeriodStatistics = true
     tooltipView.periodStatistics = Sampler.PeriodStatistics(
@@ -3416,7 +3474,7 @@ if argv.contains("--stats-test") {
         processes: [Sampler.ProcessTotal(name: "node · server.js", rxBytes: 10, txBytes: 0,
                                          viaProxy: false, fullPath: "/Users/me/Project/server.js")])
     let statisticsTooltip = tooltipView.view(tooltipView, stringForToolTip: 0,
-                                              point: NSPoint(x: 60, y: 180), userData: nil)
+                                              point: NSPoint(x: 60, y: 290), userData: nil)
     precondition(statisticsTooltip == "完整路径：\n/Users/me/Project/server.js")
 
     print("统计/身份自检通过：物理总量独立、连接归属与去重、API 故障/重启/重置基线、回环排除、应用合并、路径隐私、滚动与排序")
@@ -3488,7 +3546,7 @@ if argv.contains("--proxy-test") {
     s.setIntervals(idle: 1.0, active: 1.0)
     s.setActive(!argv.contains("--idle"))
     s.onSnapshot = { rows, rx, tx, n, period in
-        box.update(rows, rx, tx, n, raw: s.lastRawTotals, period: period)
+        box.update(rows, rx, tx, n, raw: s.lastRawTotals, at: s.snapshotTime, period: period)
     }
     s.start()
 
@@ -3575,8 +3633,8 @@ if let i = argv.firstIndex(of: "--snapshot"), i + 1 < argv.count {
             v.updateRates(rx: mb(8.4), tx: mb(1.2))
             v.procCount = 8
             v.rows = [
-                Sampler.Row(name: "Google Chrome", pid: 45565, rx: mb(5.8), tx: kb(120), viaProxy: true),
-                Sampler.Row(name: "WeChat", pid: 52526, rx: mb(1.6), tx: kb(340)),
+                Sampler.Row(name: "Google Chrome", pid: 45565, rx: mb(5.8), tx: kb(120), fullPath: "/Applications/Google Chrome.app", viaProxy: true),
+                Sampler.Row(name: "WeChat", pid: 52526, rx: mb(1.6), tx: kb(340), fullPath: "/Applications/WeChat.app"),
                 Sampler.Row(name: "node · server.js", pid: 798, rx: kb(210), tx: kb(64),
                             fullPath: NSHomeDirectory() + "/Developer/demo-api/server.js", viaProxy: true),
                 Sampler.Row(name: Sampler.unassignedTrafficName, pid: 0, rx: kb(112), tx: kb(4), viaProxy: true),
@@ -3585,17 +3643,18 @@ if let i = argv.firstIndex(of: "--snapshot"), i + 1 < argv.count {
                 Sampler.Row(name: "Dropbox", pid: 900, rx: kb(88), tx: kb(12)),
             ]
             var hist: [(rx: Double, tx: Double)] = []
-            for i in 0..<48 {
+            for i in 0..<61 {
                 let t = Double(i)
-                let down = mb(2.0 + 2.4 * sin(t / 4.1) + 1.4 * sin(t / 1.7))
+                let down = mb(max(0, 5.2 + 4.8 * sin(t / 6.1) + 2.0 * sin(t / 2.7)))
                 let up = mb(0.6 + 0.5 * sin(t / 3.3 + 1))
                 hist.append((rx: down, tx: up))
             }
-            v.history = hist
+            hist[hist.count - 1] = (rx: mb(8.4), tx: mb(1.2))
+            v.usePreviewHistory(hist)
             if v.showPeriodStatistics {
                 let processes = [
-                    Sampler.ProcessTotal(name: "Google Chrome", rxBytes: 8_420_000_000, txBytes: 1_120_000_000, viaProxy: true),
-                    Sampler.ProcessTotal(name: "WeChat", rxBytes: 4_210_000_000, txBytes: 830_000_000, viaProxy: false),
+                    Sampler.ProcessTotal(name: "Google Chrome", rxBytes: 8_420_000_000, txBytes: 1_120_000_000, viaProxy: true, fullPath: "/Applications/Google Chrome.app"),
+                    Sampler.ProcessTotal(name: "WeChat", rxBytes: 4_210_000_000, txBytes: 830_000_000, viaProxy: false, fullPath: "/Applications/WeChat.app"),
                     Sampler.ProcessTotal(name: "node · web-app", rxBytes: 2_800_000_000, txBytes: 210_000_000, viaProxy: true,
                                           fullPath: NSHomeDirectory() + "/Developer/web-app"),
                     Sampler.ProcessTotal(name: "Visual Studio Code", rxBytes: 1_780_000_000, txBytes: 440_000_000, viaProxy: true,
