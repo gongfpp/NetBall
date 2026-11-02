@@ -1065,7 +1065,10 @@ private enum Palette {
 private enum Metrics {
     static let ball: CGFloat = 140
     static let panelW: CGFloat = 392
-    static let panelH: CGFloat = 522
+    static let panelH: CGFloat = 456
+    static let tabsY: CGFloat = 184
+    static let rowsY: CGFloat = 218
+    static let rowsBottom: CGFloat = rowsY + 4 * 42 + 40
     static let pad: CGFloat = 18
 }
 
@@ -1654,7 +1657,7 @@ final class BallView: NSView {
         }
 
         NSColor(white: 1, alpha: 0.10).setFill()
-        NSRect(x: pad, y: 240, width: w - 2 * pad, height: 1).fill()
+        NSRect(x: pad, y: Metrics.tabsY - 11, width: w - 2 * pad, height: 1).fill()
 
         drawPanelTab("实时", rect: liveTabRect, selected: !showPeriodStatistics, font: fSmall)
         drawPanelTab("统计", rect: statisticsTabRect, selected: showPeriodStatistics, font: fSmall)
@@ -1674,16 +1677,16 @@ final class BallView: NSView {
             processHeading = "应用排行"
         }
         if showPeriodStatistics && periodStatistics.processes.count > 5 {
-            text(processHeading, x: pad + 112, y: 255, font: NSFont.systemFont(ofSize: 9), color: Palette.dim)
+            text(processHeading, x: pad + 112, y: Metrics.tabsY + 4, font: NSFont.systemFont(ofSize: 9), color: Palette.dim)
         }
         let downloadTitle = showPeriodStatistics && statisticsSort.column == .download
             ? "下载 \(statisticsSort.ascending ? "↑" : "↓")" : "下载"
         let uploadTitle = showPeriodStatistics && statisticsSort.column == .upload
             ? "上传 \(statisticsSort.ascending ? "↑" : "↓")" : "上传"
-        text(downloadTitle, x: w - pad - 145, y: 255, font: fSmall,
+        text(downloadTitle, x: w - pad - 145, y: Metrics.tabsY + 4, font: fSmall,
              color: showPeriodStatistics && statisticsSort.column == .download ? Palette.cyan : Palette.dim,
              align: .right, boxWidth: 62)
-        text(uploadTitle, x: w - pad - 72, y: 255, font: fSmall,
+        text(uploadTitle, x: w - pad - 72, y: Metrics.tabsY + 4, font: fSmall,
              color: showPeriodStatistics && statisticsSort.column == .upload ? Palette.amber : Palette.dim,
              align: .right, boxWidth: 68)
 
@@ -1692,22 +1695,22 @@ final class BallView: NSView {
                 byUpload: statisticsSort.column == .upload, ascending: statisticsSort.ascending)
             let top = Array(sorted.dropFirst(statisticsScrollOffset).prefix(5))
             if top.isEmpty {
-                text("这段期间还没有流量", x: pad, y: 310, font: fRow, color: Palette.dim)
+                text("这段期间还没有流量", x: pad, y: Metrics.rowsY + 25, font: fRow, color: Palette.dim)
             } else {
                 let maxTotal = max(top.map { Double($0.totalBytes) }.max() ?? 0, 1)
                 for (i, p) in top.enumerated() {
-                    drawPeriodRow(p, index: i, y: 285 + CGFloat(i) * 42, maxTotal: maxTotal,
+                    drawPeriodRow(p, index: i, y: Metrics.rowsY + CGFloat(i) * 42, maxTotal: maxTotal,
                                   fRow: fRow, fVal: fVal, w: w, pad: pad, sk: sk)
                 }
             }
         } else {
             let top = Array(rows.prefix(5))
             if top.isEmpty {
-                text(paused ? "采樣已暫停" : "正在採樣…", x: pad, y: 310, font: fRow, color: Palette.dim)
+                text(paused ? "采樣已暫停" : "正在採樣…", x: pad, y: Metrics.rowsY + 25, font: fRow, color: Palette.dim)
             } else {
                 let maxTotal = max(top[0].total, 1)
                 for (i, r) in top.enumerated() {
-                    drawRow(r, index: i, y: 285 + CGFloat(i) * 42, maxTotal: maxTotal,
+                    drawRow(r, index: i, y: Metrics.rowsY + CGFloat(i) * 42, maxTotal: maxTotal,
                             fRow: fRow, fVal: fVal, w: w, pad: pad, sk: sk)
                 }
             }
@@ -1717,10 +1720,10 @@ final class BallView: NSView {
         text(foot, x: pad, y: h - 22, font: fFoot, color: Palette.dim)
     }
 
-    private var liveTabRect: NSRect { NSRect(x: Metrics.pad, y: 251, width: 50, height: 22) }
-    private var statisticsTabRect: NSRect { NSRect(x: Metrics.pad + 54, y: 251, width: 50, height: 22) }
-    private var downloadSortRect: NSRect { NSRect(x: Metrics.panelW - Metrics.pad - 145, y: 251, width: 65, height: 22) }
-    private var uploadSortRect: NSRect { NSRect(x: Metrics.panelW - Metrics.pad - 72, y: 251, width: 68, height: 22) }
+    private var liveTabRect: NSRect { NSRect(x: Metrics.pad, y: Metrics.tabsY, width: 50, height: 22) }
+    private var statisticsTabRect: NSRect { NSRect(x: Metrics.pad + 54, y: Metrics.tabsY, width: 50, height: 22) }
+    private var downloadSortRect: NSRect { NSRect(x: Metrics.panelW - Metrics.pad - 145, y: Metrics.tabsY, width: 65, height: 22) }
+    private var uploadSortRect: NSRect { NSRect(x: Metrics.panelW - Metrics.pad - 72, y: Metrics.tabsY, width: 68, height: 22) }
     private var resetStatisticsRect: NSRect {
         NSRect(x: Metrics.panelW - Metrics.pad - 56, y: 78, width: 56, height: 22)
     }
@@ -1759,20 +1762,20 @@ final class BallView: NSView {
         text("重置", x: resetStatisticsRect.minX, y: resetStatisticsRect.minY + 4,
              font: small, color: Palette.text, align: .center, boxWidth: resetStatisticsRect.width)
 
-        text("↓ " + Fmt.bytes(periodStatistics.rxBytes), x: x, y: 130,
+        text("↓ " + Fmt.bytes(periodStatistics.rxBytes), x: x, y: 112,
              font: rate, color: Palette.cyan)
-        text("↑ " + Fmt.bytes(periodStatistics.txBytes), x: x, y: 130,
+        text("↑ " + Fmt.bytes(periodStatistics.txBytes), x: x, y: 112,
              font: rate, color: Palette.amber, align: .right, boxWidth: width)
         let elapsed = Date().timeIntervalSince(periodStatistics.since)
         text("统计时长 \(Fmt.duration(elapsed))",
-             x: x, y: 186, font: foot, color: Palette.dim)
+             x: x, y: 148, font: foot, color: Palette.dim)
     }
 
     private let panelIcons = PanelIconCache()
     var chartHoverX: CGFloat?
     private var chartTracking: NSTrackingArea?
     private var chartRect: NSRect {
-        NSRect(x: Metrics.pad + 28, y: 106, width: Metrics.panelW - Metrics.pad * 2 - 28, height: 100)
+        NSRect(x: Metrics.pad + 28, y: 96, width: Metrics.panelW - Metrics.pad * 2 - 28, height: 48)
     }
 
     /// 样例数据也保留时间语义，不影响真实采样与统计。
@@ -1925,7 +1928,7 @@ final class BallView: NSView {
             let label = axisLabel(value)
             let labelWidth = (label as NSString).size(withAttributes: [.font: font]).width
             text(label, x: min(r.maxX - labelWidth, max(r.minX, p.x + 6)),
-                 y: max(r.minY - 13, p.y - 16), font: font, color: color)
+                 y: max(r.minY + 2, p.y - 14), font: font, color: color)
         }
         if let x = chartHoverX, let sample = model.nearest(at: Double((x - r.minX) / r.width)) {
             let selectedX = point(sample, 0).x
@@ -1936,7 +1939,7 @@ final class BallView: NSView {
                 let p = point(sample, value)
                 color.setFill(); NSBezierPath(ovalIn: NSRect(x: p.x - 3, y: p.y - 3, width: 6, height: 6)).fill()
             }
-            let bubble = NSRect(x: min(r.maxX - 130, max(r.minX, selectedX - 140)), y: r.minY + 7, width: 130, height: 59)
+            let bubble = NSRect(x: min(r.maxX - 130, max(r.minX, selectedX - 140)), y: r.minY - 4, width: 130, height: 55)
             NSColor(srgbRed: 0.09, green: 0.12, blue: 0.15, alpha: 0.97).setFill()
             NSBezierPath(roundedRect: bubble, xRadius: 8, yRadius: 8).fill()
             let date = Calendar.current.dateComponents([.hour, .minute, .second], from: sample.at)
@@ -2084,7 +2087,7 @@ final class BallView: NSView {
         super.resetCursorRects()
         removeAllToolTips()
         guard expanded else { return }
-        addToolTip(NSRect(x: Metrics.pad, y: 285, width: Metrics.panelW - 2 * Metrics.pad, height: 208),
+        addToolTip(NSRect(x: Metrics.pad, y: Metrics.rowsY, width: Metrics.panelW - 2 * Metrics.pad, height: 208),
                        owner: self, userData: nil)
         addToolTip(NSRect(x: Metrics.pad, y: Metrics.panelH - 24, width: Metrics.panelW - 2 * Metrics.pad, height: 24),
                    owner: self, userData: nil)
@@ -2103,7 +2106,7 @@ final class BallView: NSView {
         if point.y >= Metrics.panelH - 24 {
             return "最近约30秒 CPU均值（100%=一个核心）：自身 \(Fmt.pct(selfCPU)) + 采集工具 \(Fmt.pct(nettopCPU))。\n内存仅为主程序；不含子进程或 WindowServer。\n明细间隔是CPU预算目标；受网速档位、扫描用时与调度影响，实际可能更久。明细速率为扫描区间平均值。\n网速\(intervalLabel)；明细目标\(detailIntervalLabel)。"
         }
-        let offset = point.y - 285
+        let offset = point.y - Metrics.rowsY
         guard offset >= 0 else { return "" }
         let index = Int(offset / 42)
         let withinRow = offset - CGFloat(index) * 42
@@ -2132,7 +2135,7 @@ final class BallView: NSView {
             return
         }
         let point = convert(event.locationInWindow, from: nil)
-        guard point.y >= 285 && point.y < 493 else {
+        guard point.y >= Metrics.rowsY && point.y < Metrics.rowsBottom else {
             statisticsScrollAccumulator.reset()
             super.scrollWheel(with: event)
             return
@@ -3333,6 +3336,8 @@ if argv.contains("--ease-test") {
 }
 
 if argv.contains("--stats-test") {
+    precondition(Metrics.rowsBottom < Metrics.panelH - 24, "列表不可覆盖底部信息")
+    precondition(Metrics.tabsY + 22 < Metrics.rowsY, "标签不可覆盖首行")
     let presentationFailures = PanelPresentationTests.run()
     precondition(presentationFailures.isEmpty, presentationFailures.joined(separator: "\n"))
     let columnFont = NSFont.monospacedDigitSystemFont(ofSize: 12.5, weight: .semibold)
@@ -3466,7 +3471,7 @@ if argv.contains("--stats-test") {
     tooltipView.rows = [Sampler.Row(name: "node · server.js", pid: 1, rx: 10, tx: 0,
                                     fullPath: "/Users/me/Project/server.js")]
     let liveTooltip = tooltipView.view(tooltipView, stringForToolTip: 0,
-                                       point: NSPoint(x: 60, y: 290), userData: nil)
+                                       point: NSPoint(x: 60, y: Metrics.rowsY + 5), userData: nil)
     precondition(liveTooltip == "完整路径：\n/Users/me/Project/server.js")
     tooltipView.showPeriodStatistics = true
     tooltipView.periodStatistics = Sampler.PeriodStatistics(
@@ -3474,7 +3479,7 @@ if argv.contains("--stats-test") {
         processes: [Sampler.ProcessTotal(name: "node · server.js", rxBytes: 10, txBytes: 0,
                                          viaProxy: false, fullPath: "/Users/me/Project/server.js")])
     let statisticsTooltip = tooltipView.view(tooltipView, stringForToolTip: 0,
-                                              point: NSPoint(x: 60, y: 290), userData: nil)
+                                              point: NSPoint(x: 60, y: Metrics.rowsY + 5), userData: nil)
     precondition(statisticsTooltip == "完整路径：\n/Users/me/Project/server.js")
 
     print("统计/身份自检通过：物理总量独立、连接归属与去重、API 故障/重启/重置基线、回环排除、应用合并、路径隐私、滚动与排序")
