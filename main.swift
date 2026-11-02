@@ -1220,19 +1220,24 @@ final class BallView: NSView {
     weak var controller: Controller?
 
     var expanded = false {
-        didSet { if !expanded { chartHoverX = nil } }
+        didSet {
+            if !expanded { chartHoverX = nil }
+            refreshToolTipRegions()
+        }
     }
-    var rows: [Sampler.Row] = []
+    var rows: [Sampler.Row] = [] { didSet { refreshToolTipRegions() } }
     var totalRx = 0.0
     var totalTx = 0.0
     var procCount = 0
     var history: [PanelChartSample] = []
-    var showPeriodStatistics = false
+    var showPeriodStatistics = false { didSet { refreshToolTipRegions() } }
     var periodStatistics = Sampler.PeriodStatistics(since: Date(), rxBytes: 0, txBytes: 0,
-                                                    externalInterfaces: [], processes: [])
-    var statisticsScrollOffset = 0
+                                                    externalInterfaces: [], processes: []) {
+        didSet { refreshToolTipRegions() }
+    }
+    var statisticsScrollOffset = 0 { didSet { refreshToolTipRegions() } }
     var statisticsScrollAccumulator = Sampler.StatisticsScrollAccumulator()
-    private var statisticsSort = Sampler.StatisticsSortState()
+    private var statisticsSort = Sampler.StatisticsSortState() { didSet { refreshToolTipRegions() } }
     var selfCPU = 0.0
     var selfMemMB = 0.0
     var nettopCPU = 0.0
@@ -1806,7 +1811,7 @@ final class BallView: NSView {
                            index: index, y: y, fRow: fRow, fVal: fVal, w: w, pad: pad, sk: sk)
     }
 
-    /// 实时与累计共享列宽，路径留在悬停提示，不再挤占名称。
+    /// 实时与累计共享列宽；脚本进程在原有40pt行内保留身份路径。
     private func drawApplicationRow(name: String, path: String?, proxy: Bool, unassigned: Bool,
                                     rx: String, tx: String, ratio: Double, index: Int, y: CGFloat,
                                     fRow: NSFont, fVal: NSFont, w: CGFloat, pad: CGFloat, sk: PanelSkin) {
@@ -1828,8 +1833,12 @@ final class BallView: NSView {
         let valueStart = row.maxX - 145
         let badgeWidth: CGFloat = proxy ? 25 : 0
         let room = max(12, valueStart - nameX - badgeWidth - 8)
-        text(truncated(name, font: fRow, maxWidth: room), x: nameX, y: y + 10,
+        let identityPath = RuntimePathPresentation.subtitle(name: name, path: path)
+        text(truncated(name, font: fRow, maxWidth: room), x: nameX, y: y + (identityPath == nil ? 10 : 3),
              font: fRow, color: Palette.text)
+        if let identityPath {
+            drawIdentityPath(identityPath, x: nameX, y: y + 25, maxWidth: row.maxX - 9 - nameX)
+        }
         if proxy {
             let badge = NSRect(x: valueStart - 28, y: y + 12, width: 24, height: 14)
             Palette.cyan.withAlphaComponent(0.14).setFill()
@@ -1838,7 +1847,7 @@ final class BallView: NSView {
         }
         drawColumnValue(rx, x: valueStart, y: y, font: fVal, color: Palette.cyan)
         drawColumnValue(tx, x: valueStart + 73, y: y, font: fVal, color: Palette.amber)
-        let track = NSRect(x: nameX, y: y + 34, width: row.maxX - 9 - nameX, height: 2)
+        let track = NSRect(x: nameX, y: y + (identityPath == nil ? 34 : 37), width: row.maxX - 9 - nameX, height: 2)
         NSColor(white: 1, alpha: 0.05).setFill()
         NSBezierPath(roundedRect: track, xRadius: 1, yRadius: 1).fill()
         if ratio.isFinite && ratio > 0 {
@@ -1953,6 +1962,14 @@ final class BallView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.acceptsMouseMovedEvents = true
+        // 菜单栏应用不抢焦点；系统默认禁止后台应用显示tooltip，需显式开启。
+        window?.allowsToolTipsWhenApplicationIsInactive = true
+        refreshToolTipRegions(force: true)
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        refreshToolTipRegions()
     }
 
     override func updateTrackingAreas() {
@@ -1960,6 +1977,7 @@ final class BallView: NSView {
         if let chartTracking { removeTrackingArea(chartTracking) }
         let area = NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
         addTrackingArea(area); chartTracking = area
+        refreshToolTipRegions()
     }
 
     override func mouseMoved(with event: NSEvent) {
@@ -2083,14 +2101,52 @@ final class BallView: NSView {
         controller?.toggleExpanded()
     }
 
+    private(set) var registeredToolTipRects: [NSRect] = []
+    private(set) var toolTipRegistrationGeneration = 0
+    private var registeredToolTipKeys: [String] = []
+
+    private func rowToolTipStrings() -> [String] {
+        let identities: [(String?, Bool)]
+        if showPeriodStatistics {
+            identities = periodStatistics.sortedProcesses(
+                byUpload: statisticsSort.column == .upload, ascending: statisticsSort.ascending)
+                .dropFirst(max(0, statisticsScrollOffset)).prefix(5)
+                .map { ($0.fullPath, $0.isUnassigned && $0.viaProxy) }
+        } else {
+            identities = rows.prefix(5).map { ($0.fullPath, $0.isUnassigned && $0.viaProxy) }
+        }
+        return identities.map { path, unassigned in
+            if unassigned { return "Clash：尚不能确认具体应用的代理连接；不是物理总量减去明细的剩余值。" }
+            guard let path, !path.isEmpty else { return "" }
+            return "完整路径：\n\(path)"
+        }
+    }
+
+    /// 按行安装；只有几何或身份变化才重建，速率更新和cursor重置不打断悬停等待。
+    private func refreshToolTipRegions(force: Bool = false) {
+        var rects: [NSRect] = []
+        var keys: [String] = []
+        if expanded, window != nil {
+            for (index, value) in rowToolTipStrings().enumerated() where !value.isEmpty {
+                let rect = NSRect(x: Metrics.pad, y: Metrics.rowsY + CGFloat(index) * 42,
+                                  width: Metrics.panelW - 2 * Metrics.pad, height: 40)
+                if bounds.contains(rect) { rects.append(rect); keys.append(value) }
+            }
+            let footer = NSRect(x: Metrics.pad, y: Metrics.panelH - 24,
+                                width: Metrics.panelW - 2 * Metrics.pad, height: 24)
+            if bounds.contains(footer) { rects.append(footer); keys.append("资源读数") }
+        }
+        guard force || rects != registeredToolTipRects || keys != registeredToolTipKeys else { return }
+        removeAllToolTips()
+        registeredToolTipRects = rects
+        registeredToolTipKeys = keys
+        toolTipRegistrationGeneration += 1
+        for rect in rects { addToolTip(rect, owner: self, userData: nil) }
+    }
+
     override func resetCursorRects() {
         super.resetCursorRects()
-        removeAllToolTips()
         guard expanded else { return }
-        addToolTip(NSRect(x: Metrics.pad, y: Metrics.rowsY, width: Metrics.panelW - 2 * Metrics.pad, height: 208),
-                       owner: self, userData: nil)
-        addToolTip(NSRect(x: Metrics.pad, y: Metrics.panelH - 24, width: Metrics.panelW - 2 * Metrics.pad, height: 24),
-                   owner: self, userData: nil)
         addCursorRect(liveTabRect, cursor: .pointingHand)
         addCursorRect(statisticsTabRect, cursor: .pointingHand)
         if showPeriodStatistics {
@@ -2112,21 +2168,8 @@ final class BallView: NSView {
         let withinRow = offset - CGFloat(index) * 42
         guard index < 5, withinRow < 40 else { return "" }
 
-        let fullPath: String?
-        let unassigned: Bool
-        if showPeriodStatistics {
-            let sorted = periodStatistics.sortedProcesses(
-                byUpload: statisticsSort.column == .upload, ascending: statisticsSort.ascending)
-            let processIndex = statisticsScrollOffset + index
-            fullPath = processIndex < sorted.count ? sorted[processIndex].fullPath : nil
-            unassigned = processIndex < sorted.count && sorted[processIndex].isUnassigned && sorted[processIndex].viaProxy
-        } else {
-            fullPath = index < rows.count ? rows[index].fullPath : nil
-            unassigned = index < rows.count && rows[index].isUnassigned && rows[index].viaProxy
-        }
-        if unassigned { return "Clash：尚不能确认具体应用的代理连接；不是物理总量减去明细的剩余值。" }
-        guard let fullPath else { return "" }
-        return "完整路径：\n\(fullPath)"
+        let values = rowToolTipStrings()
+        return index < values.count ? values[index] : ""
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -3482,7 +3525,53 @@ if argv.contains("--stats-test") {
                                               point: NSPoint(x: 60, y: Metrics.rowsY + 5), userData: nil)
     precondition(statisticsTooltip == "完整路径：\n/Users/me/Project/server.js")
 
-    print("统计/身份自检通过：物理总量独立、连接归属与去重、API 故障/重启/重置基线、回环排除、应用合并、路径隐私、滚动与排序")
+    // 离屏验证窗口策略和区域生命周期；真实系统tooltip显示仍需本机悬停验收。
+    _ = NSApplication.shared
+    let tooltipWindow = NSWindow(contentRect: tooltipView.frame, styleMask: [.borderless],
+                                 backing: .buffered, defer: false)
+    tooltipWindow.isReleasedWhenClosed = false
+    tooltipWindow.contentView = tooltipView
+    precondition(tooltipWindow.allowsToolTipsWhenApplicationIsInactive)
+    precondition(!tooltipWindow.isVisible && !tooltipWindow.isKeyWindow, "路径提示不应靠抢焦点启用")
+    precondition(tooltipView.registeredToolTipRects.count == 2, "路径行和资源读数应分别注册")
+    let registration = tooltipView.toolTipRegistrationGeneration
+    tooltipView.resetCursorRects()
+    let unchangedIdentities = tooltipView.periodStatistics
+    tooltipView.periodStatistics = Sampler.PeriodStatistics(
+        since: unchangedIdentities.since, rxBytes: unchangedIdentities.rxBytes + 1,
+        txBytes: unchangedIdentities.txBytes, externalInterfaces: unchangedIdentities.externalInterfaces,
+        processes: unchangedIdentities.processes)
+    precondition(tooltipView.toolTipRegistrationGeneration == registration, "普通数值刷新不能打断悬停等待")
+    tooltipView.showPeriodStatistics = false
+    tooltipView.rows.append(Sampler.Row(name: "node · other", pid: 2, rx: 20, tx: 0, fullPath: "/tmp/Other"))
+    precondition(tooltipView.registeredToolTipRects.count == 3)
+    precondition(tooltipView.registeredToolTipRects[1].minY - tooltipView.registeredToolTipRects[0].maxY == 2)
+    precondition(tooltipView.view(tooltipView, stringForToolTip: 0,
+                                 point: NSPoint(x: 60, y: Metrics.rowsY + 41), userData: nil).isEmpty)
+    precondition(tooltipView.view(tooltipView, stringForToolTip: 0,
+                                 point: NSPoint(x: 60, y: Metrics.rowsY + 47), userData: nil) == "完整路径：\n/tmp/Other")
+    let beforeIdentityChange = tooltipView.toolTipRegistrationGeneration
+    tooltipView.rows[1].fullPath = "/tmp/Changed"
+    precondition(tooltipView.toolTipRegistrationGeneration > beforeIdentityChange, "身份变化必须更新区域")
+    tooltipView.periodStatistics = Sampler.PeriodStatistics(
+        since: Date(), rxBytes: 6, txBytes: 0, externalInterfaces: [],
+        processes: [Sampler.ProcessTotal(name: "node · A", rxBytes: 3, txBytes: 0, viaProxy: false, fullPath: "/tmp/A"),
+                    Sampler.ProcessTotal(name: "node · B", rxBytes: 2, txBytes: 0, viaProxy: false, fullPath: "/tmp/B"),
+                    Sampler.ProcessTotal(name: "node · C", rxBytes: 1, txBytes: 0, viaProxy: false, fullPath: "/tmp/C")])
+    tooltipView.showPeriodStatistics = true
+    tooltipView.statisticsScrollOffset = 1
+    precondition(tooltipView.view(tooltipView, stringForToolTip: 0,
+                                 point: NSPoint(x: 60, y: Metrics.rowsY + 5), userData: nil) == "完整路径：\n/tmp/B")
+    tooltipView.expanded = false
+    precondition(tooltipView.registeredToolTipRects.isEmpty)
+    tooltipView.setFrameSize(NSSize(width: 140, height: 140))
+    tooltipView.expanded = true
+    precondition(tooltipView.registeredToolTipRects.isEmpty, "展开前不能把超出视图的区域误记为已安装")
+    tooltipView.setFrameSize(NSSize(width: Metrics.panelW, height: Metrics.panelH))
+    precondition(tooltipView.registeredToolTipRects.count == 3, "尺寸恢复后应重新安装路径区域")
+    precondition(Metrics.panelH == 456 && Metrics.rowsBottom == 426, "恢复路径不增加面板或列表高度")
+
+    print("统计/身份自检通过：物理总量独立、连接归属与去重、API 故障/重启/重置基线、回环排除、应用合并、路径隐私、后台悬停区域、滚动与排序")
     exit(0)
 }
 

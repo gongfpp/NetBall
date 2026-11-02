@@ -149,6 +149,20 @@ final class PanelIconCache {
     }
 }
 
+/// 只为脚本运行时恢复身份路径；沿用已采集路径，不猜项目根目录，也不读取命令行。
+enum RuntimePathPresentation {
+    static func subtitle(name: String, path: String?) -> String? {
+        guard let path, !path.isEmpty, (path as NSString).isAbsolutePath,
+              URL(fileURLWithPath: path).pathExtension.lowercased() != "app" else { return nil }
+        let runtime = name.split(separator: "·", maxSplits: 1).first?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let runtimes: Set<String> = ["node", "nodejs", "bun", "deno", "uv", "python", "python2", "python3", "ruby", "perl", "php"]
+        let pythonVersion = runtime.hasPrefix("python") && !runtime.dropFirst(6).isEmpty
+            && runtime.dropFirst(6).allSatisfy { $0.isNumber || $0 == "." }
+        return runtimes.contains(runtime) || pythonVersion ? path : nil
+    }
+}
+
 /// 返回失败说明；不启动应用、不查网络、不创建测试文件。
 enum PanelPresentationTests {
     static func run() -> [String] {
@@ -203,6 +217,17 @@ enum PanelPresentationTests {
         let huge = PanelChartModel(samples: [sample(0, .greatestFiniteMagnitude, 0)], end: end)
         check(huge.maxValue.isFinite && huge.tickValues.allSatisfy(\.isFinite), "极大峰值不能让坐标轴溢出")
         check(huge.tickValues.last == huge.maxValue, "最高刻度覆盖峰值")
+
+        check(RuntimePathPresentation.subtitle(name: "node · api", path: "/Users/me/Project A") == "/Users/me/Project A", "已有项目目录不能再取父目录")
+        check(RuntimePathPresentation.subtitle(name: "node · server.js", path: "/Users/me/api/server.js") == "/Users/me/api/server.js", "脚本路径保持原始身份，不猜目录")
+        check(RuntimePathPresentation.subtitle(name: "nodejs", path: "/tmp/项目") == "/tmp/项目", "Node别名和中文路径可显示")
+        check(RuntimePathPresentation.subtitle(name: "python3.13", path: "/tmp/tool.py") == "/tmp/tool.py", "版本化脚本运行时可显示已有路径")
+        check(RuntimePathPresentation.subtitle(name: "uv", path: "/Users/me/.local/bin/uv") != nil, "uv保留已采集的可执行路径")
+        for (name, path) in [("Google Chrome", "/Applications/Google Chrome.app"), ("node", "/Applications/Runtime.app"),
+                             ("node-tools", "/tmp/project"), ("node", "relative.js"), ("node", "")] {
+            check(RuntimePathPresentation.subtitle(name: name, path: path) == nil, "普通应用或无效身份不添加路径副标题")
+        }
+        check(RuntimePathPresentation.subtitle(name: "node", path: nil) == nil, "缺失路径不能伪造目录")
 
         var loads: [String: Int] = [:]
         let image = NSImage(size: NSSize(width: 16, height: 16))
