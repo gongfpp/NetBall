@@ -25,7 +25,7 @@ macOS 菜单栏网络流量监控。常驻显示实时上下行速率，也可�
 
 ### 下载应用
 
-当前发布包需要 **macOS 26 或更新版本**及 **Apple Silicon（arm64）**，直接使用不需要安装 Swift。较旧 macOS 的兼容性尚未验证。
+从 **v1.2.10** 起，发布包的最低部署目标为 **macOS 12.0**，仅支持 **Apple Silicon（arm64）**，直接使用不需要安装 Swift。已核对二进制中的真实最低版本并在 macOS 26 上通过构建与自检；尚未在 macOS 12–15 实机验证，不保证所有旧系统环境均无问题。v1.2.9 的旧下载包仍要求 macOS 26，使用较旧系统请下载 v1.2.10 或更新版本。
 
 1. 从[最新 Release](https://github.com/gongfpp/NetBall/releases/latest) 下载 ZIP 包。
 2. 解压，将应用放到固定位置后打开。程序常驻菜单栏，不显示 Dock 图标。
@@ -35,7 +35,7 @@ macOS 菜单栏网络流量监控。常驻显示实时上下行速率，也可�
 
 ### 从源码编译
 
-需要 Swift 编译器（可通过 Xcode Command Line Tools 安装）。构建脚本使用本机编译器的默认目标，不保证产物兼容较旧 macOS。在项目目录运行：
+需要 Swift 编译器及 macOS SDK（可通过 Xcode Command Line Tools 安装）。构建脚本显式指定 `arm64-apple-macosx12.0`，并在打包前核对 Mach-O 的最低版本、架构及其与 `Info.plist` 的一致性，避免随开发机默认目标升高。在项目目录运行：
 
 ```bash
 ./build.sh

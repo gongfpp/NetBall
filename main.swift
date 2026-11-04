@@ -85,11 +85,12 @@ private let timebase: (numer: Double, denom: Double) = {
     return (Double(tb.numer), Double(tb.denom))
 }()
 
-private func rusageV6(_ pid: pid_t) -> rusage_info_v6? {
-    var info = rusage_info_v6()
+// 所用字段均在 V0 中，避免新版 flavor 在旧内核上查询失败却显示零开销。
+private func rusageV0(_ pid: pid_t) -> rusage_info_v0? {
+    var info = rusage_info_v0()
     let rc = withUnsafeMutablePointer(to: &info) { p in
         p.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rp in
-            proc_pid_rusage(pid, RUSAGE_INFO_V6, rp)
+            proc_pid_rusage(pid, RUSAGE_INFO_V0, rp)
         }
     }
     return rc == 0 ? info : nil
@@ -97,14 +98,14 @@ private func rusageV6(_ pid: pid_t) -> rusage_info_v6? {
 
 /// 进程累计 CPU 秒数
 private func cpuSeconds(_ pid: pid_t) -> Double? {
-    guard let i = rusageV6(pid) else { return nil }
+    guard let i = rusageV0(pid) else { return nil }
     let ticks = Double(i.ri_user_time + i.ri_system_time)
     return ticks * timebase.numer / timebase.denom / 1e9
 }
 
 /// 进程物理内存占用（phys_footprint，比 RSS 更贴近真实开销）
 private func footprintBytes(_ pid: pid_t) -> UInt64 {
-    rusageV6(pid)?.ri_phys_footprint ?? 0
+    rusageV0(pid)?.ri_phys_footprint ?? 0
 }
 
 /// PID 必须连同进程创建时间一起使用，避免退出后复用 PID 把流量归给旧应用。
@@ -117,7 +118,7 @@ private func processIncarnation(_ pid: Int) -> String? {
     }
     // 部分进程无法读取 BSD 元数据时，仍可用内核提供的启动时钟验证同一生命周期。
     // 两种接口均不可读就不猜 PID 身份，也不生成每轮变化的伪启动时间。
-    return processLifetime(pid: pid, bsdStart: nil, absoluteStart: rusageV6(pid_t(pid))?.ri_proc_start_abstime)
+    return processLifetime(pid: pid, bsdStart: nil, absoluteStart: rusageV0(pid_t(pid))?.ri_proc_start_abstime)
 }
 
 private func processLifetime(pid: Int, bsdStart: (UInt64, UInt64)?, absoluteStart: UInt64?) -> String? {
@@ -3379,6 +3380,11 @@ if argv.contains("--ease-test") {
 }
 
 if argv.contains("--stats-test") {
+    guard let resources = rusageV0(getpid()) else { fatalError("基础资源接口 V0 不可读") }
+    precondition(resources.ri_phys_footprint > 0 && resources.ri_proc_start_abstime > 0)
+    precondition((cpuSeconds(getpid()) ?? -1) >= 0 && footprintBytes(getpid()) > 0)
+    precondition(rusageV0(-1) == nil, "无效 PID 不得产生伪资源数据")
+    print("基础资源接口 V0 自检通过")
     precondition(Metrics.rowsBottom < Metrics.panelH - 24, "列表不可覆盖底部信息")
     precondition(Metrics.tabsY + 22 < Metrics.rowsY, "标签不可覆盖首行")
     let presentationFailures = PanelPresentationTests.run()
