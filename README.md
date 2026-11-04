@@ -2,6 +2,8 @@
 
 macOS 菜单栏网络流量监控。常驻显示实时上下行速率，也可查看流量曲线、进程排行和累计数据；支持可选悬浮球。
 
+[下载最新版](https://github.com/gongfpp/NetBall/releases/latest) · [更新记录](https://github.com/gongfpp/NetBall/releases)
+
 <p align="center">
   <img src="shots/menubar-live.png" width="360" alt="macOS 菜单栏中的 NetBall，显示实时下行和上行速率">
 </p>
@@ -21,14 +23,46 @@ macOS 菜单栏网络流量监控。常驻显示实时上下行速率，也可�
 
 ## 开始使用
 
-需要 **macOS 12 或更新版本**及 Swift 编译器。在项目目录运行：
+### 下载应用
+
+需要 **macOS 12 或更新版本**。当前发布包为 **Apple Silicon（arm64）**，直接使用不需要安装 Swift。
+
+1. 从[最新 Release](https://github.com/gongfpp/NetBall/releases/latest) 下载 ZIP 包。
+2. 解压，将应用放到固定位置后打开。程序常驻菜单栏，不显示 Dock 图标。
+3. 悬停菜单栏图标展开面板，点击图标打开设置和退出菜单。
+
+发布包使用 ad-hoc 临时签名，未经过 Apple 公证。若首次打开时被系统拦截，请先确认下载来源，再按 macOS「隐私与安全性」中的提示操作，不要关闭全局安全检查。
+
+### 从源码编译
+
+需要 Swift 编译器（可通过 Xcode Command Line Tools 安装）。在项目目录运行：
 
 ```bash
 ./build.sh
 open NetBall.app
 ```
 
-点击菜单栏图标打开设置和退出菜单。可选开机启动：`./install-autostart.sh`；程序移动位置后需重新运行该脚本。
+构建脚本会替换项目目录中的旧应用包。可选开机启动：编译后在项目目录运行[开机启动脚本](install-autostart.sh)：
+
+```bash
+./install-autostart.sh
+```
+
+应用移动位置后需重新运行该脚本。
+
+### 更新与自检
+
+更新时先从菜单退出旧版，再替换并打开新版；累计统计会重新起算，不保留历史。
+
+从源码构建后，可运行本地自检：
+
+```bash
+./build/NetBall --stats-test
+./build/NetBall --fmt-test
+./build/NetBall --ease-test
+```
+
+自检覆盖统计、归属、身份路径、图表和提示区域等逻辑；后台系统悬停提示是否实际出现，仍需在应用中验证。
 
 ## 统计说明
 
