@@ -3,6 +3,7 @@ build/
 .modulecache/
 NetBall.app/
 .netball.pid
+NetBall-*-macos.zip
 
 # 本地环境
 .venv/
