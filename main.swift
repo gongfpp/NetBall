@@ -485,6 +485,29 @@ private struct ExternalInterfaceSnapshot {
     }
 }
 
+extension UnattributedSource {
+    /// 未归属行在列表里显示的子标签，口径与账本一致。
+    var label: String {
+        switch self {
+        case .unknownOwner: return "Clash"
+        case .unverifiedProcess: return "其他进程"
+        case .proxyCore: return "Clash 核心"
+        }
+    }
+
+    /// 悬停说明，解释这批字节为什么落不到具体应用上。
+    var explanation: String {
+        switch self {
+        case .unknownOwner:
+            return "Clash：这些代理连接目前还不能确认具体应用。"
+        case .unverifiedProcess:
+            return "其他进程：这些 socket 的流量能读到，但读不到进程启动时间，无法确认是哪个应用。"
+        case .proxyCore:
+            return "Clash 核心：代理核心 wire 字节里没被 API payload 覆盖的部分（协议开销，或 API 不可用时无法按应用归属的流量）。"
+        }
+    }
+}
+
 final class Sampler {
     static let unassignedTrafficName = "未归属流量"
 
@@ -501,6 +524,10 @@ final class Sampler {
         var fullPath: String? = nil
         /// 这条流量是经代理出去的（ProxyProbe 打标）
         var viaProxy = false
+        /// 未归属行的来源说明，例如“其他进程”“Clash 核心”。
+        var detail: String? = nil
+        /// 本轮代理归属降级（API 不可用或内核刚切换），只影响说明文字。
+        var attributionDegraded = false
         var total: Double { rx + tx }
         var isUnassigned: Bool { name == Sampler.unassignedTrafficName && fullPath == nil }
     }
@@ -511,8 +538,11 @@ final class Sampler {
         var txBytes: UInt64
         var viaProxy: Bool
         var fullPath: String? = nil
+        /// 未归属行的来源说明；不同来源各自累计一行，避免口径混在一起。
+        var detail: String? = nil
+        var attributionDegraded = false
         var totalBytes: UInt64 { rxBytes &+ txBytes }
-        var identityKey: String { name + "\u{0}" + (fullPath ?? "") }
+        var identityKey: String { name + "\u{0}" + (fullPath ?? "") + "\u{0}" + (detail ?? "") }
         var isUnassigned: Bool { name == Sampler.unassignedTrafficName && fullPath == nil }
     }
 
@@ -593,12 +623,15 @@ final class Sampler {
             externalInterfaces = interfaces
         }
 
-        mutating func add(name: String, rx: UInt64, tx: UInt64, viaProxy: Bool, fullPath: String? = nil) {
-            let identity = ProcessTotal(name: name, rxBytes: 0, txBytes: 0, viaProxy: false, fullPath: fullPath)
+        mutating func add(name: String, rx: UInt64, tx: UInt64, viaProxy: Bool, fullPath: String? = nil,
+                          detail: String? = nil, degraded: Bool = false) {
+            let identity = ProcessTotal(name: name, rxBytes: 0, txBytes: 0, viaProxy: false, fullPath: fullPath,
+                                        detail: detail)
             var p = byIdentity[identity.identityKey] ?? identity
             p.rxBytes &+= rx
             p.txBytes &+= tx
             p.viaProxy = p.viaProxy || viaProxy
+            p.attributionDegraded = p.attributionDegraded || degraded
             byIdentity[identity.identityKey] = p
         }
 
@@ -803,7 +836,9 @@ final class Sampler {
                     for delta in sample.deltas {
                         let owner = delta.owner
                         periodAccumulator.add(name: owner == .unknown ? Self.unassignedTrafficName : owner.name,
-                                              rx: delta.rx, tx: delta.tx, viaProxy: delta.viaProxy, fullPath: owner.path)
+                                              rx: delta.rx, tx: delta.tx, viaProxy: delta.viaProxy,
+                                              fullPath: owner.path, detail: delta.unattributed?.label,
+                                              degraded: delta.unattributed == .proxyCore && sample.degraded)
                     }
                 }
             }
@@ -848,7 +883,8 @@ final class Sampler {
             precondition(release.wait(timeout: .now() + 5) == .success)
             let now = Date()
             let delta = TrafficDelta(owner: .unknown, rx: 123, tx: 456, rxRate: 123, txRate: 456, viaProxy: true)
-            return DetailSample(rows: [], deltas: [delta], status: "stale-test", raw: (0, 0), core: (0, 0),
+            return DetailSample(rows: [], deltas: [delta], status: "stale-test", degraded: false,
+                                raw: (0, 0), core: (0, 0),
                                 childrenCPU: 0.1, effort: 0.1, started: now, finished: now)
         }
         sampler.queue.sync { sampler.running = true; sampler.poll() }
@@ -879,6 +915,7 @@ final class Sampler {
         let rows: [Row]
         let deltas: [TrafficDelta]
         let status: String
+        let degraded: Bool
         let raw: (rx: Double, tx: Double)
         let core: (rx: Double, tx: Double)
         let childrenCPU: Double
@@ -907,10 +944,12 @@ final class Sampler {
                 return TrafficOwner(pid: pid, incarnation: verifiedLifetimes[pid] ?? "\(pid):unverified", name: name)
             }
         }
-        var ambiguousIdentities = snapshot?.ambiguousIdentities ?? []
-        // 启动时间不可验证时只保留既有基线，既不把旧 PID 当作当前应用，也不回放失败区间。
+        let ambiguousIdentities = snapshot?.ambiguousIdentities ?? []
+        // 读不到启动时间的进程：这些 socket 的字节仍然真实存在，不能静默丢弃。
+        // 账本会把它们列进“未归属流量 → 其他进程”，只是不允许落到具体应用身份上。
+        var unverifiedKeys: Set<String> = []
         for socket in snapshot?.sockets ?? [] where socket.owner.pid.map(unverifiedPIDs.contains) == true {
-            ambiguousIdentities.insert(socket.key)
+            unverifiedKeys.insert(socket.key)
         }
         if snapshot != nil { verifiedLifetimes = verifiedLifetimes.filter { observedPIDs.contains($0.key) } }
         var parsed = snapshot?.sockets.filter { $0.owner.pid.map(unverifiedPIDs.contains) != true }
@@ -932,10 +971,18 @@ final class Sampler {
         }
         let proxySnapshot = proxy.poll(sockets: parsed, at: socketTime)
         let now = Date()
-        let deltas = attribution.sample(sockets: parsed, proxy: proxySnapshot,
-                                       corePIDs: proxy.corePIDs, at: now, ambiguousSocketIdentities: ambiguousIdentities)
+        // 账本需要看到全部 socket：已验证的用解析后的身份，未验证的保留原始 owner 但只入未归属行。
+        var ledgerSockets = parsed
+        if let all = snapshot?.sockets, !unverifiedKeys.isEmpty {
+            ledgerSockets = (parsed ?? []) + all.filter { unverifiedKeys.contains($0.key) }
+        }
+        let deltas = attribution.sample(sockets: ledgerSockets, proxy: proxySnapshot,
+                                       corePIDs: proxy.corePIDs, at: now,
+                                       ambiguousSocketIdentities: ambiguousIdentities,
+                                       unverifiedSocketKeys: unverifiedKeys)
+        let degraded = attribution.proxyAttributionDegraded
         var status = proxy.status
-        if parsed == nil { status = "进程归属不可用" }
+        if ledgerSockets == nil { status = "进程归属不可用" }
         else if !unverifiedPIDs.isEmpty { status = "部分进程身份不可读" }
         else if !attribution.diagnostics.isEmpty, proxySnapshot != nil {
             status = "代理归属不完整"
@@ -945,18 +992,22 @@ final class Sampler {
         var byIdentity: [String: Row] = [:]
         for delta in deltas {
             let owner = delta.owner
+            let detail = delta.unattributed?.label
             let name = owner == .unknown ? Sampler.unassignedTrafficName : owner.name
-            let key = name + "\u{0}" + (owner.path ?? "")
+            let key = name + "\u{0}" + (owner.path ?? "") + "\u{0}" + (detail ?? "")
             let previous = byIdentity[key]
             byIdentity[key] = Row(name: name, pid: previous?.pid ?? owner.pid ?? 0,
                                   rx: (previous?.rx ?? 0) + delta.rxRate,
                                   tx: (previous?.tx ?? 0) + delta.txRate,
-                                  fullPath: owner.path, viaProxy: (previous?.viaProxy ?? false) || delta.viaProxy)
+                                  fullPath: owner.path, viaProxy: (previous?.viaProxy ?? false) || delta.viaProxy,
+                                  detail: detail,
+                                  attributionDegraded: (previous?.attributionDegraded ?? false)
+                                      || (delta.unattributed == .proxyCore && degraded))
         }
         let rows = byIdentity.values.sorted { $0.total > $1.total }
 
         var rawRx = 0.0, rawTx = 0.0, coreRx = 0.0, coreTx = 0.0
-        if let sockets = parsed {
+        if let sockets = ledgerSockets {
             var current: [String: (rx: UInt64, tx: UInt64, at: Date)] = [:]
             for socket in sockets where ExternalInterfaceSnapshot.isExternalInterfaceName(socket.interface)
                 && !socket.local.isLoopback && !socket.remote.isLoopback {
@@ -973,7 +1024,7 @@ final class Sampler {
         }
         let childrenCPU = max(0, Self.reapedChildrenCPU() - cpuBefore)
         let ownCPU = max(0, (cpuSeconds(getpid()) ?? ownBefore) - ownBefore)
-        return DetailSample(rows: rows, deltas: deltas, status: status,
+        return DetailSample(rows: rows, deltas: deltas, status: status, degraded: degraded,
                             raw: (rawRx, rawTx), core: (coreRx, coreTx), childrenCPU: childrenCPU,
                             effort: childrenCPU + ownCPU, started: started, finished: Date())
     }
@@ -1800,20 +1851,24 @@ final class BallView: NSView {
 
     private func drawPeriodRow(_ p: Sampler.ProcessTotal, index: Int, y: CGFloat, maxTotal: Double,
                                fRow: NSFont, fVal: NSFont, w: CGFloat, pad: CGFloat, sk: PanelSkin) {
-        drawApplicationRow(name: p.name, path: p.fullPath, proxy: p.viaProxy, unassigned: p.isUnassigned,
+        drawApplicationRow(name: p.name, path: p.fullPath, detail: p.detail,
+                           degraded: p.attributionDegraded,
+                           proxy: p.viaProxy, unassigned: p.isUnassigned,
                            rx: Fmt.bytes(p.rxBytes), tx: Fmt.bytes(p.txBytes), ratio: Double(p.totalBytes) / maxTotal,
                            index: index, y: y, fRow: fRow, fVal: fVal, w: w, pad: pad, sk: sk)
     }
 
     private func drawRow(_ r: Sampler.Row, index: Int, y: CGFloat, maxTotal: Double,
                          fRow: NSFont, fVal: NSFont, w: CGFloat, pad: CGFloat, sk: PanelSkin) {
-        drawApplicationRow(name: r.name, path: r.fullPath, proxy: r.viaProxy, unassigned: r.isUnassigned,
+        drawApplicationRow(name: r.name, path: r.fullPath, detail: r.detail, degraded: r.attributionDegraded,
+                           proxy: r.viaProxy, unassigned: r.isUnassigned,
                            rx: Fmt.rate(r.rx), tx: Fmt.rate(r.tx), ratio: r.total / maxTotal,
                            index: index, y: y, fRow: fRow, fVal: fVal, w: w, pad: pad, sk: sk)
     }
 
     /// 实时与累计共享列宽；脚本进程在原有40pt行内保留身份路径。
-    private func drawApplicationRow(name: String, path: String?, proxy: Bool, unassigned: Bool,
+    private func drawApplicationRow(name: String, path: String?, detail: String? = nil, degraded: Bool = false,
+                                    proxy: Bool, unassigned: Bool,
                                     rx: String, tx: String, ratio: Double, index: Int, y: CGFloat,
                                     fRow: NSFont, fVal: NSFont, w: CGFloat, pad: CGFloat, sk: PanelSkin) {
         let row = NSRect(x: pad, y: y, width: w - 2 * pad, height: 40)
@@ -1834,7 +1889,9 @@ final class BallView: NSView {
         let valueStart = row.maxX - 145
         let badgeWidth: CGFloat = proxy ? 25 : 0
         let room = max(12, valueStart - nameX - badgeWidth - 8)
-        let identityPath = RuntimePathPresentation.subtitle(name: name, path: path)
+        // 未归属行用来源说明（其他进程 / Clash 核心）代替路径；降级时补一句状态。
+        let identityPath: String? = detail.map { degraded ? "\($0) · 归属暂不可用" : $0 }
+            ?? RuntimePathPresentation.subtitle(name: name, path: path)
         text(truncated(name, font: fRow, maxWidth: room), x: nameX, y: y + (identityPath == nil ? 10 : 3),
              font: fRow, color: Palette.text)
         if let identityPath {
@@ -2107,19 +2164,32 @@ final class BallView: NSView {
     private var registeredToolTipKeys: [String] = []
 
     private func rowToolTipStrings() -> [String] {
-        let identities: [(String?, Bool)]
+        let items: [(path: String?, detail: String?, degraded: Bool)]
         if showPeriodStatistics {
-            identities = periodStatistics.sortedProcesses(
+            items = periodStatistics.sortedProcesses(
                 byUpload: statisticsSort.column == .upload, ascending: statisticsSort.ascending)
                 .dropFirst(max(0, statisticsScrollOffset)).prefix(5)
-                .map { ($0.fullPath, $0.isUnassigned && $0.viaProxy) }
+                .map { ($0.fullPath, $0.detail, $0.attributionDegraded) }
         } else {
-            identities = rows.prefix(5).map { ($0.fullPath, $0.isUnassigned && $0.viaProxy) }
+            items = rows.prefix(5).map { ($0.fullPath, $0.detail, $0.attributionDegraded) }
         }
-        return identities.map { path, unassigned in
-            if unassigned { return "Clash：尚不能确认具体应用的代理连接；不是物理总量减去明细的剩余值。" }
+        return items.map { path, detail, degraded in
+            // 未归属行的子标签本身就是口径说明，悬停补一句“为什么归不到应用”。
+            if let detail {
+                let text = detailText(for: detail)
+                guard degraded else { return text }
+                return text + "\n归属暂不可用：代理 API 不可用或内核正在切换，本轮只能按核心 wire 字节计入。"
+            }
             guard let path, !path.isEmpty else { return "" }
             return "完整路径：\n\(path)"
+        }
+    }
+
+    private func detailText(for label: String) -> String {
+        switch label {
+        case UnattributedSource.unverifiedProcess.label: return UnattributedSource.unverifiedProcess.explanation
+        case UnattributedSource.proxyCore.label: return UnattributedSource.proxyCore.explanation
+        default: return UnattributedSource.unknownOwner.explanation
         }
     }
 
@@ -3491,6 +3561,20 @@ if argv.contains("--stats-test") {
     precondition(identityRows.first(where: { $0.fullPath == "/Applications/Visual Studio Code.app" })?.rxBytes == 300)
     precondition(identityRows.first(where: { $0.fullPath == "/Applications/Visual Studio Code.app" })?.viaProxy == true)
 
+    // 未归属来源各自成行：同名同路径的“其他进程”和“Clash 核心”不能并进任何应用。
+    var unattributed = Sampler.PeriodAccumulator()
+    unattributed.add(name: Sampler.unassignedTrafficName, rx: 100, tx: 10, viaProxy: false,
+                     fullPath: nil, detail: "其他进程", degraded: false)
+    unattributed.add(name: Sampler.unassignedTrafficName, rx: 200, tx: 20, viaProxy: true,
+                     fullPath: nil, detail: "Clash 核心", degraded: false)
+    unattributed.add(name: Sampler.unassignedTrafficName, rx: 400, tx: 40, viaProxy: true,
+                     fullPath: nil, detail: "Clash 核心", degraded: true)
+    let unattributedRows = unattributed.snapshot().processes
+    precondition(unattributedRows.count == 2)
+    precondition(unattributedRows.first(where: { $0.detail == "其他进程" })?.rxBytes == 100)
+    let coreRow = unattributedRows.first(where: { $0.detail == "Clash 核心" })
+    precondition(coreRow?.rxBytes == 600 && coreRow?.attributionDegraded == true)
+
     precondition(ProcessIdentityResolver.isElectron("Electron Helper"))
     precondition(ProcessIdentityResolver.isNode("node"))
     precondition(ProcessIdentityResolver.isUV("uv"))
@@ -3530,6 +3614,27 @@ if argv.contains("--stats-test") {
     let statisticsTooltip = tooltipView.view(tooltipView, stringForToolTip: 0,
                                               point: NSPoint(x: 60, y: Metrics.rowsY + 5), userData: nil)
     precondition(statisticsTooltip == "完整路径：\n/Users/me/Project/server.js")
+
+    // 未归属行不暴露路径，而是解释来源；“归属暂不可用”追加到同一提示里。
+    tooltipView.periodStatistics = Sampler.PeriodStatistics(
+        since: Date(), rxBytes: 10, txBytes: 0, externalInterfaces: ["en0"],
+        processes: [Sampler.ProcessTotal(name: Sampler.unassignedTrafficName, rxBytes: 10, txBytes: 0,
+                                         viaProxy: false, fullPath: nil, detail: "其他进程")])
+    let unverifiedTooltip = tooltipView.view(tooltipView, stringForToolTip: 0,
+                                             point: NSPoint(x: 60, y: Metrics.rowsY + 5), userData: nil)
+    precondition(unverifiedTooltip.hasPrefix("其他进程：") && !unverifiedTooltip.contains("完整路径"))
+    tooltipView.periodStatistics = Sampler.PeriodStatistics(
+        since: Date(), rxBytes: 10, txBytes: 0, externalInterfaces: ["en0"],
+        processes: [Sampler.ProcessTotal(name: Sampler.unassignedTrafficName, rxBytes: 10, txBytes: 0,
+                                         viaProxy: true, fullPath: nil, detail: "Clash 核心",
+                                         attributionDegraded: true)])
+    let degradedTooltip = tooltipView.view(tooltipView, stringForToolTip: 0,
+                                           point: NSPoint(x: 60, y: Metrics.rowsY + 5), userData: nil)
+    precondition(degradedTooltip.contains("Clash 核心：") && degradedTooltip.contains("归属暂不可用"))
+    tooltipView.periodStatistics = Sampler.PeriodStatistics(
+        since: Date(), rxBytes: 10, txBytes: 0, externalInterfaces: ["en0"],
+        processes: [Sampler.ProcessTotal(name: "node · server.js", rxBytes: 10, txBytes: 0,
+                                         viaProxy: false, fullPath: "/Users/me/Project/server.js")])
 
     // 离屏验证窗口策略和区域生命周期；真实系统tooltip显示仍需本机悬停验收。
     _ = NSApplication.shared
@@ -3661,7 +3766,7 @@ if argv.contains("--proxy-test") {
     s.deliverQueue.sync {}
 
     print("控制器端点: \(s.proxy.endpointDesc ?? "未找到 —— 不猜测代理应用归属")")
-    print("代理核心 PID: \(s.proxy.corePIDs.sorted())  （wire bytes 仅诊断，绝不加回明细）")
+    print("代理核心 PID: \(s.proxy.corePIDs.sorted())  （wire 里 API 没覆盖的残差按未归属字节计入）")
     print("走代理的 PID: \(s.proxy.proxiedPIDs.sorted())")
     print(String(format: "\n峰值那一刻："))
     print(String(format: "  物理网卡外网总量       ↓%-12@ ↑%-12@",
@@ -3670,11 +3775,12 @@ if argv.contains("--proxy-test") {
                  Fmt.rate(best.raw.rx) as NSString, Fmt.rate(best.raw.tx) as NSString, best.count))
     let (_, _, _, _, _, period) = box.snapshot
     print("归属状态: \(period.attributionStatus)")
-    print("\n应用排行（代理 payload + 去重直连，不含回环及核心 wire bytes）:")
+    print("\n应用排行（代理 payload + 去重直连，含按来源标注的未归属字节，不含回环）:")
     for r in best.rows.prefix(8) {
-        print(String(format: "  %-24@ pid %-7d ↓%-11@ ↑%-11@%@",
+        let label = [r.detail.map { " · \($0)" } ?? "", r.attributionDegraded ? " · 归属暂不可用" : ""].joined()
+        print(String(format: "  %-24@ pid %-7d ↓%-11@ ↑%-11@%@%@",
                      r.name as NSString, r.pid, Fmt.rate(r.rx) as NSString,
-                     Fmt.rate(r.tx) as NSString, (r.viaProxy ? "  [代理]" : "") as NSString))
+                     Fmt.rate(r.tx) as NSString, (r.viaProxy ? "  [代理]" : "") as NSString, label as NSString))
     }
     print("累计：物理 ↓\(Fmt.bytes(period.rxBytes)) ↑\(Fmt.bytes(period.txBytes))；\(period.processes.count) 个应用身份")
     if let index = argv.firstIndex(of: "--report-json"), index + 1 < argv.count {
@@ -3683,7 +3789,8 @@ if argv.contains("--proxy-test") {
             "since": period.since.timeIntervalSince1970, "status": period.attributionStatus,
             "processes": period.processes.map { process -> [String: Any] in
                 ["name": process.name, "path": process.fullPath ?? "", "rx": process.rxBytes,
-                 "tx": process.txBytes, "viaProxy": process.viaProxy]
+                 "tx": process.txBytes, "viaProxy": process.viaProxy,
+                 "unattributed": process.detail ?? "", "degraded": process.attributionDegraded]
             }
         ]
         do {
@@ -3737,7 +3844,8 @@ if let i = argv.firstIndex(of: "--snapshot"), i + 1 < argv.count {
                 Sampler.Row(name: "WeChat", pid: 52526, rx: mb(1.6), tx: kb(340), fullPath: "/Applications/WeChat.app"),
                 Sampler.Row(name: "node · server.js", pid: 798, rx: kb(210), tx: kb(64),
                             fullPath: NSHomeDirectory() + "/Developer/demo-api/server.js", viaProxy: true),
-                Sampler.Row(name: Sampler.unassignedTrafficName, pid: 0, rx: kb(112), tx: kb(4), viaProxy: true),
+                Sampler.Row(name: Sampler.unassignedTrafficName, pid: 0, rx: kb(112), tx: kb(4), viaProxy: true,
+                            detail: "Clash 核心"),
                 Sampler.Row(name: "Visual Studio Code", pid: 45599, rx: kb(96), tx: kb(18),
                             fullPath: "/Applications/Visual Studio Code.app", viaProxy: true),
                 Sampler.Row(name: "Dropbox", pid: 900, rx: kb(88), tx: kb(12)),
@@ -3759,8 +3867,10 @@ if let i = argv.firstIndex(of: "--snapshot"), i + 1 < argv.count {
                                           fullPath: NSHomeDirectory() + "/Developer/web-app"),
                     Sampler.ProcessTotal(name: "Visual Studio Code", rxBytes: 1_780_000_000, txBytes: 440_000_000, viaProxy: true,
                                           fullPath: "/Applications/Visual Studio Code.app"),
+                    Sampler.ProcessTotal(name: Sampler.unassignedTrafficName, rxBytes: 1_900_000_000,
+                                         txBytes: 4_200_000, viaProxy: true, detail: "其他进程"),
                     Sampler.ProcessTotal(name: Sampler.unassignedTrafficName, rxBytes: 1_400_000_000,
-                                         txBytes: 3_400_000, viaProxy: true),
+                                         txBytes: 3_400_000, viaProxy: true, detail: "Clash 核心"),
                     Sampler.ProcessTotal(name: "uv", rxBytes: 1_250_000_000, txBytes: 120_000, viaProxy: false,
                                           fullPath: NSHomeDirectory() + "/.local/bin/uv"),
                     Sampler.ProcessTotal(name: "Dropbox", rxBytes: 940_000_000, txBytes: 150_000_000, viaProxy: false),

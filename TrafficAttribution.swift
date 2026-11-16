@@ -320,6 +320,16 @@ struct ProxyTrafficSnapshot {
     }
 }
 
+/// 未归属字节的来源。只影响展示与解释；字节本身仍走同一套去重规则。
+enum UnattributedSource {
+    /// API 报告了 payload，但映射不到具体进程。
+    case unknownOwner
+    /// socket 可见，但进程启动时间不可读，无法确认是哪个应用。
+    case unverifiedProcess
+    /// 代理核心 wire 字节里没被 API payload 覆盖的那部分。
+    case proxyCore
+}
+
 struct TrafficDelta {
     let owner: TrafficOwner
     let rx: UInt64
@@ -327,6 +337,19 @@ struct TrafficDelta {
     let rxRate: Double
     let txRate: Double
     let viaProxy: Bool
+    /// 非 nil 表示这批字节无法归属到应用，只能在“未归属流量”里按来源列出。
+    let unattributed: UnattributedSource?
+
+    init(owner: TrafficOwner, rx: UInt64, tx: UInt64, rxRate: Double, txRate: Double,
+         viaProxy: Bool, unattributed: UnattributedSource? = nil) {
+        self.owner = owner
+        self.rx = rx
+        self.tx = tx
+        self.rxRate = rxRate
+        self.txRate = txRate
+        self.viaProxy = viaProxy
+        self.unattributed = unattributed
+    }
 }
 
 private func keyParts(_ parts: [String]) -> String {
@@ -363,9 +386,18 @@ struct AttributionLedger {
         var socketIdentity: String?
         var needsRebaseline = false
     }
+    /// 代理核心物理网卡 socket 的上一轮计数，只用来求 wire 残差。
+    private struct CoreBaseline {
+        var rx: UInt64
+        var tx: UInt64
+        var at: Date
+        var tuple: Tuple
+    }
 
     private var socketBaselines: [String: Baseline] = [:]
     private var proxyBaselines: [ProxyKey: Baseline] = [:]
+    private var coreBaselines: [String: CoreBaseline] = [:]
+    private var lastCoreAt: Date?
     private var proxyEpoch: String?
     private var lastHealthyProxyBoundary: Date?
     private var resetAt: Date?
@@ -373,6 +405,11 @@ struct AttributionLedger {
     private var lastProxySources: Set<Source> = []
     private var lastTunEnabled = false
     private var proxyWasUnavailable = false
+    /// API 不可用期间是否已经把核心 wire 字节显式计入未归属。
+    /// 这些字节随 API 恢复会再次出现在 flow 累计里，恢复首轮必须重设基线而不是补差值。
+    private var wireCountedDuringOutage = false
+    /// 本轮代理归属是否降级：API 不可用，或代理内核刚重启导致基线重建。
+    private(set) var proxyAttributionDegraded = false
     private static let retention: TimeInterval = 24 * 60 * 60
     private static let capacity = 16_384
 
@@ -381,6 +418,8 @@ struct AttributionLedger {
     mutating func reset(at: Date) {
         socketBaselines.removeAll()
         proxyBaselines.removeAll()
+        coreBaselines.removeAll()
+        lastCoreAt = nil
         proxyEpoch = nil
         lastHealthyProxyBoundary = nil
         resetAt = at
@@ -388,14 +427,21 @@ struct AttributionLedger {
         lastProxySources.removeAll()
         lastTunEnabled = false
         proxyWasUnavailable = false
+        wireCountedDuringOutage = false
+        proxyAttributionDegraded = false
         diagnostics = []
     }
 
     mutating func sample(sockets: [SocketTraffic]?, proxy: ProxyTrafficSnapshot?,
                          corePIDs: Set<Int>, at: Date,
-                         ambiguousSocketIdentities: Set<String> = []) -> [TrafficDelta] {
+                         ambiguousSocketIdentities: Set<String> = [],
+                         unverifiedSocketKeys: Set<String> = []) -> [TrafficDelta] {
         diagnostics = []
+        proxyAttributionDegraded = false
         var result: [TrafficDelta] = []
+        // 本轮 API 已归属的 payload 与核心 wire 字节，用来求无法归属的残差。
+        var apiBytes = (rx: UInt64(0), tx: UInt64(0))
+        var wireBytes = (rx: UInt64(0), tx: UInt64(0))
         var apiTuples = lastProxyTuples
         var apiSources = lastProxySources
         var tunEnabled = lastTunEnabled
@@ -405,6 +451,7 @@ struct AttributionLedger {
                 // Parent must include the core incarnation/restart in epoch.
                 // Direct sockets are independent of a core restart.
                 proxyBaselines.removeAll()
+                proxyAttributionDegraded = true
                 diagnostics.append("proxy-epoch-changed: proxy counters rebaselined")
             }
             tunEnabled = snapshot.tunEnabled || snapshot.flows.contains { $0.type.lowercased() == "tun" }
@@ -414,7 +461,14 @@ struct AttributionLedger {
                 // been counted. A newly discovered TUN flow cannot replay that gap.
                 diagnostics.append("tun-mode-changed-during-outage: unseen API flows rebaselined")
             }
-            let newFlowBoundary = epochChanged || uncertainTunTransition ? nil : (lastHealthyProxyBoundary ?? resetAt)
+            // 上一次 API 不可用且已把 wire 字节算进未归属：恢复首轮只更新基线，
+            // 不补 flow 差值，否则同一批字节会被算第二次。
+            let recoveryAfterWire = proxyWasUnavailable && wireCountedDuringOutage
+            if recoveryAfterWire {
+                diagnostics.append("proxy-recovery-rebaselined: outage bytes already surfaced as core wire")
+            }
+            let newFlowBoundary = epochChanged || uncertainTunTransition || recoveryAfterWire
+                ? nil : (lastHealthyProxyBoundary ?? resetAt)
             proxyEpoch = snapshot.epoch
             apiTuples = Set(snapshot.flows.map { Tuple(network: $0.network, source: $0.source, destination: $0.destination) })
             apiSources = Set(snapshot.flows.map { Source(network: $0.network, endpoint: $0.source) })
@@ -427,8 +481,14 @@ struct AttributionLedger {
                 }
                 let tuple = Tuple(network: flow.network, source: flow.source, destination: flow.destination)
                 if var baseline = proxyBaselines[key], baseline.tuple == tuple {
-                    appendDelta(rx: flow.rx, tx: flow.tx, baseline: baseline, at: at,
-                                viaProxy: flow.viaProxy, into: &result)
+                    let unknownOwner = baseline.owner == nil || baseline.owner == .unknown
+                    if !recoveryAfterWire,
+                       let delta = appendDelta(rx: flow.rx, tx: flow.tx, baseline: baseline, at: at,
+                                               viaProxy: flow.viaProxy,
+                                               unattributed: unknownOwner ? .unknownOwner : nil,
+                                               into: &result) {
+                        apiBytes.rx += delta.rx; apiBytes.tx += delta.tx
+                    }
                     // Ownership discovered now applies only to future intervals.
                     if baseline.owner == nil || baseline.owner == .unknown, let known = flow.owner {
                         // A validated executable-path owner can be known without
@@ -443,8 +503,12 @@ struct AttributionLedger {
                         let zero = Baseline(rx: 0, tx: 0, at: start, owner: flow.owner, tuple: tuple)
                         // Changed tuples with a reused id are not demonstrably new.
                         if proxyBaselines[key] == nil {
-                            appendDelta(rx: flow.rx, tx: flow.tx, baseline: zero, at: at,
-                                        viaProxy: flow.viaProxy, into: &result)
+                            if let delta = appendDelta(rx: flow.rx, tx: flow.tx, baseline: zero, at: at,
+                                                       viaProxy: flow.viaProxy,
+                                                       unattributed: flow.owner == nil ? .unknownOwner : nil,
+                                                       into: &result) {
+                                apiBytes.rx += delta.rx; apiBytes.tx += delta.tx
+                            }
                         }
                     }
                     let previousOwner = proxyBaselines[key]?.owner
@@ -463,9 +527,11 @@ struct AttributionLedger {
             lastProxySources = apiSources
             lastTunEnabled = tunEnabled
             proxyWasUnavailable = false
+            wireCountedDuringOutage = false
             pruneProxy(at: at)
         } else {
             proxyWasUnavailable = true
+            proxyAttributionDegraded = true
             diagnostics.append("proxy-unavailable: retained baselines; core wire bytes are excluded")
             if tunEnabled {
                 diagnostics.append("tun-api-unavailable: physical socket deltas suppressed to avoid recovery double count")
@@ -507,6 +573,20 @@ struct AttributionLedger {
                     diagnostics.append("ambiguous-socket-identity: duplicate rows excluded")
                     continue
                 }
+                if let pid = socket.owner.pid, corePIDs.contains(pid), isPhysicalSocket(socket) {
+                    // 代理核心自己的 wire 字节不进应用行，先只累积；循环结束后
+                    // 用“wire 减 API payload”得到这一轮确实无法归属的残差。
+                    let coreKey = socketBaselineKey(socket)
+                    let coreTuple = Tuple(network: socket.network, source: socket.local, destination: socket.remote)
+                    if let baseline = coreBaselines[coreKey], baseline.tuple == coreTuple,
+                       socket.rx >= baseline.rx, socket.tx >= baseline.tx {
+                        wireBytes.rx += socket.rx - baseline.rx
+                        wireBytes.tx += socket.tx - baseline.tx
+                    }
+                    coreBaselines[coreKey] = CoreBaseline(rx: socket.rx, tx: socket.tx, at: at, tuple: coreTuple)
+                    continue
+                }
+                let unverified = unverifiedSocketKeys.contains(socket.key)
                 guard isDirectCandidate(socket, corePIDs: corePIDs) else { continue }
                 let tuple = Tuple(network: socket.network, source: socket.local, destination: socket.remote)
                 let source = Source(network: socket.network, endpoint: socket.local)
@@ -530,7 +610,9 @@ struct AttributionLedger {
                     baseline.coveredByAPI = baseline.coveredByAPI || exactMatch || sourceMatch
                     if !suppress && !baseline.coveredByAPI && !baseline.needsRebaseline {
                         appendDelta(rx: socket.rx, tx: socket.tx, baseline: baseline,
-                                    at: at, viaProxy: false, into: &result)
+                                    at: at, viaProxy: false,
+                                    unattributed: unverified ? .unverifiedProcess : nil,
+                                    into: &result)
                     }
                     baseline.rx = socket.rx; baseline.tx = socket.tx; baseline.at = at
                     baseline.needsRebaseline = false
@@ -544,6 +626,20 @@ struct AttributionLedger {
             if ambiguousSource {
                 diagnostics.append("tun-source-ambiguous: API preferred; same-source physical sockets excluded")
             }
+            // 残差用字节差而不是速率差：API 恢复后补报的 payload 已经计入过，
+            // 直接相减会得到 0，从而不会把同一批字节重复计一次。
+            let residualRx = wireBytes.rx > apiBytes.rx ? wireBytes.rx - apiBytes.rx : 0
+            let residualTx = wireBytes.tx > apiBytes.tx ? wireBytes.tx - apiBytes.tx : 0
+            let span = lastCoreAt.map { at.timeIntervalSince($0) } ?? 0
+            if (residualRx > 0 || residualTx > 0), span > 0 {
+                result.append(TrafficDelta(owner: .unknown, rx: residualRx, tx: residualTx,
+                                           rxRate: Double(residualRx) / span,
+                                           txRate: Double(residualTx) / span,
+                                           viaProxy: true, unattributed: .proxyCore))
+                if proxy == nil { wireCountedDuringOutage = true }
+            }
+            lastCoreAt = at
+            pruneCores(at: at)
             pruneSockets(at: at)
         } else {
             diagnostics.append("nettop-unavailable: retained socket baselines")
@@ -552,15 +648,22 @@ struct AttributionLedger {
         return result
     }
 
+    @discardableResult
     private func appendDelta(rx: UInt64, tx: UInt64, baseline: Baseline, at: Date,
-                             viaProxy: Bool, into result: inout [TrafficDelta]) {
+                             viaProxy: Bool, unattributed: UnattributedSource? = nil,
+                             into result: inout [TrafficDelta]) -> TrafficDelta? {
         let dt = at.timeIntervalSince(baseline.at)
-        guard dt > 0, rx >= baseline.rx, tx >= baseline.tx else { return }
+        guard dt > 0, rx >= baseline.rx, tx >= baseline.tx else { return nil }
         let received = rx - baseline.rx
         let sent = tx - baseline.tx
-        guard received > 0 || sent > 0 else { return }
-        result.append(TrafficDelta(owner: baseline.owner ?? .unknown, rx: received, tx: sent,
-                                   rxRate: Double(received) / dt, txRate: Double(sent) / dt, viaProxy: viaProxy))
+        guard received > 0 || sent > 0 else { return nil }
+        // 未归属来源一律不落到具体进程上，避免把字节算到读不到身份的行里。
+        let owner = unattributed == nil ? (baseline.owner ?? .unknown) : .unknown
+        let delta = TrafficDelta(owner: owner, rx: received, tx: sent,
+                                 rxRate: Double(received) / dt, txRate: Double(sent) / dt,
+                                 viaProxy: viaProxy, unattributed: unattributed)
+        result.append(delta)
+        return delta
     }
 
     private func socketIdentity(_ socket: SocketTraffic) -> String {
@@ -572,20 +675,30 @@ struct AttributionLedger {
         keyParts([socket.key, socketIdentity(socket)])
     }
 
+    /// 物理网卡(enN)上两端都非回环的 tcp/udp socket。只看“是不是真的走了外网”。
+    private func isPhysicalSocket(_ socket: SocketTraffic) -> Bool {
+        let suffix = socket.interface.dropFirst(2)
+        return ["tcp", "udp"].contains(socket.network)
+            && socket.interface.hasPrefix("en") && !suffix.isEmpty
+            && suffix.utf8.allSatisfy { $0 >= 48 && $0 <= 57 }
+            && !socket.local.isLoopback && !socket.remote.isLoopback
+    }
+
     private func isDirectCandidate(_ socket: SocketTraffic, corePIDs: Set<Int>) -> Bool {
         if let pid = socket.owner.pid, corePIDs.contains(pid) { return false }
         // Only a concrete local endpoint on a physical interface qualifies.
         // The peer exception is UDP-only; TCP listeners, unbound UDP and core
         // sockets remain excluded, as do loopback and virtual interfaces.
-        guard ["tcp", "udp"].contains(socket.network), socket.interface.hasPrefix("en"),
-              !socket.interface.dropFirst(2).isEmpty,
-              socket.interface.dropFirst(2).utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
-              !socket.local.isLoopback, !socket.remote.isLoopback,
-              !socket.local.isUnspecified,
+        guard isPhysicalSocket(socket), !socket.local.isUnspecified,
               socket.local.address != socket.remote.address,
               (socket.isUnconnectedUDP || (!socket.remote.isUnspecified && (1...65535).contains(socket.remote.port))),
               (1...65535).contains(socket.local.port) else { return false }
         return true
+    }
+
+    private mutating func pruneCores(at: Date) {
+        // wire 基线只需要跨一两个采样周期；长期消失的核心 socket 重新出现时应重新起算。
+        coreBaselines = coreBaselines.filter { at.timeIntervalSince($0.value.at) <= 60 }
     }
 
     private mutating func pruneSockets(at: Date) {
@@ -760,8 +873,13 @@ enum AttributionSelfTests {
                           proxy: snapshot([flow(100, owner: app, source: client, type: "HTTPS", via: false)]), corePIDs: [900], at: time(1))
         let systemDirect = ledger.sample(sockets: [socket(200, source: client, destination: loop, interface: "lo0"), socket(900, key: "core", owner: core)],
                                          proxy: snapshot([flow(140, owner: app, source: client, type: "HTTPS", via: false)]), corePIDs: [900], at: time(2))
-        check(amount(systemDirect) == 40 && systemDirect.first?.viaProxy == false, "system proxy DIRECT counts only API payload")
-        check(ledger.sample(sockets: [socket(300, source: client, destination: loop, interface: "en0"), socket(1500, key: "core", owner: core)], proxy: nil, corePIDs: [900], at: time(3)).isEmpty, "no system proxy loopback fallback")
+        let systemDirectAttributed = systemDirect.filter { $0.unattributed == nil }
+        check(amount(systemDirectAttributed) == 40 && systemDirectAttributed.first?.viaProxy == false, "system proxy DIRECT counts only API payload")
+        // 核心 wire 里没被 API payload 覆盖的 360 字节不能算给应用，也不能丢掉，而是显式列为未归属。
+        check(systemDirect.filter { $0.unattributed == .proxyCore }.reduce(0) { $0 + $1.rx } == 360, "uncovered core wire surfaces as unattributed proxy bytes")
+        let outageDirect = ledger.sample(sockets: [socket(300, source: client, destination: loop, interface: "en0"), socket(1500, key: "core", owner: core)], proxy: nil, corePIDs: [900], at: time(3))
+        check(outageDirect.allSatisfy { $0.unattributed == .proxyCore }, "no system proxy loopback fallback")
+        check(outageDirect.contains { $0.rx == 600 } && ledger.proxyAttributionDegraded, "API outage surfaces core wire residual and marks attribution degraded")
 
         ledger = AttributionLedger()
         let directLocal = TrafficEndpoint(address: "192.0.2.10", port: 50001)
@@ -842,7 +960,9 @@ enum AttributionSelfTests {
         _ = ledger.sample(sockets: unsafeUDP, proxy: snapshot([]), corePIDs: [900], at: time(1))
         let unsafeMore = unsafeUDP.map { SocketTraffic(key: $0.key, owner: $0.owner, network: $0.network,
             local: $0.local, remote: $0.remote, interface: $0.interface, rx: 200, tx: 100) }
-        check(ledger.sample(sockets: unsafeMore, proxy: snapshot([]), corePIDs: [900], at: time(2)).isEmpty, "UDP relaxation never admits wildcard local, IPC, virtual interfaces or core bytes")
+        let unsafeResult = ledger.sample(sockets: unsafeMore, proxy: snapshot([]), corePIDs: [900], at: time(2))
+        check(unsafeResult.allSatisfy { $0.unattributed == .proxyCore }, "UDP relaxation never admits wildcard local, IPC, virtual interfaces or core bytes")
+        check(unsafeResult.reduce(0) { $0 + $1.rx } == 100, "core UDP wire is only surfaced as unattributed")
 
         func udpAPI(_ count: UInt64, tun: Bool) -> ProxyTrafficSnapshot {
             snapshot([ProxyTraffic(id: "udp-api", start: time(0), network: "udp", type: tun ? "Tun" : "Socks5",
@@ -951,6 +1071,45 @@ enum AttributionSelfTests {
         ledger = AttributionLedger()
         _ = ledger.sample(sockets: [], proxy: snapshot([], acquired: 99), corePIDs: [], at: time(10))
         check(amount(ledger.sample(sockets: [], proxy: snapshot([flow(10, start: 10.5)], acquired: 11), corePIDs: [], at: time(12))) == 10, "invalid future acquisition time falls back to processing boundary")
+        // A：读不到进程身份的 socket 不能静默消失，但也不能落到任何应用名下。
+        ledger = AttributionLedger()
+        let unverifiedOwner = TrafficOwner(pid: 555, incarnation: "555@1", name: "apsd")
+        _ = ledger.sample(sockets: [socket(1000, key: "unverified", owner: unverifiedOwner)], proxy: nil,
+                          corePIDs: [], at: time(30), unverifiedSocketKeys: ["unverified"])
+        let unverifiedDelta = ledger.sample(sockets: [socket(1600, key: "unverified", owner: unverifiedOwner)],
+                                            proxy: nil, corePIDs: [], at: time(32),
+                                            unverifiedSocketKeys: ["unverified"])
+        check(unverifiedDelta.count == 1 && unverifiedDelta[0].unattributed == .unverifiedProcess
+              && unverifiedDelta[0].rx == 600, "unverifiable process bytes surface as unattributed instead of vanishing")
+        check(unverifiedDelta[0].owner == .unknown && !unverifiedDelta[0].viaProxy,
+              "unverifiable bytes never claim an application identity")
+        // 身份恢复可读后只能从新基线算，不能回放身份不可读期间的历史。
+        let identityRecovered = ledger.sample(sockets: [socket(1600, key: "unverified", owner: app)], proxy: nil,
+                                              corePIDs: [], at: time(34))
+        check(identityRecovered.isEmpty, "identity recovery rebaselines instead of replaying unverified history")
+
+        // B：核心 wire 被 API 完全覆盖时不产生未归属行；未覆盖部分按字节差显式列出。
+        ledger = AttributionLedger()
+        _ = ledger.sample(sockets: [socket(1000, key: "wire", owner: core)],
+                          proxy: snapshot([flow(1000, id: "wire-flow", owner: app)]), corePIDs: [900], at: time(40))
+        let fullyCovered = ledger.sample(sockets: [socket(2000, key: "wire", owner: core)],
+                                         proxy: snapshot([flow(2000, id: "wire-flow", owner: app)]), corePIDs: [900], at: time(42))
+        check(fullyCovered.allSatisfy { $0.unattributed == nil } && amount(fullyCovered) == 1000,
+              "fully covered core wire adds no unattributed row")
+        let wireOutage = ledger.sample(sockets: [socket(5000, key: "wire", owner: core)], proxy: nil,
+                                       corePIDs: [900], at: time(44))
+        check(wireOutage.count == 1 && wireOutage[0].unattributed == .proxyCore && wireOutage[0].rx == 3000,
+              "API outage surfaces the uncovered core wire delta")
+        check(ledger.proxyAttributionDegraded, "API outage marks proxy attribution degraded")
+        // 恢复首轮只重设基线：这些字节已按 wire 计过，不能再补 flow 差值。
+        let wireRecovery = ledger.sample(sockets: [socket(5000, key: "wire", owner: core)],
+                                         proxy: snapshot([flow(5000, id: "wire-flow", owner: app)]), corePIDs: [900], at: time(46))
+        check(wireRecovery.isEmpty, "API recovery does not double count outage bytes already surfaced as core wire")
+        let afterRecovery = ledger.sample(sockets: [socket(6000, key: "wire", owner: core)],
+                                          proxy: snapshot([flow(6000, id: "wire-flow", owner: app)]), corePIDs: [900], at: time(48))
+        check(amount(afterRecovery) == 1000 && afterRecovery.allSatisfy { $0.unattributed == nil },
+              "attribution resumes from rebaselined counters after recovery")
+
         print("AttributionSelfTests: passed")
     }
 }
